@@ -32,9 +32,9 @@ This creates a Python 3.13 virtual environment, installs `torch` and `numpy`, th
 
 ### Model Architecture
 
-- **Stage 1 (HeadVAE)**: Unconditional VAE — `256→32→16→(μ:4)` / `4→16→32→256`
-- **Stages 2–4 (ConditionalVAE)**: Encoder `256→32→(μ:3)`, Decoder `(3+256)→32→256`
-- **Loss**: BCE with 2× weight on new pixels + β·KLD with linear warmup (0→0.8 over epochs 100–400)
+- **Stage 1 (HeadVAE)**: Unconditional VAE — `256→64→32→(μ:4)` / `4→32→64→256`
+- **Stages 2–4 (ConditionalVAE)**: Encoder `256→64→(μ:3)`, Decoder `(3+256)→64→256`
+- **Loss**: BCE with 2× weight on new pixels + β·KLD with linear warmup (0→0.1 over epochs 300–700)
 
 ### Data Format
 

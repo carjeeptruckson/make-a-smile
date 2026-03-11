@@ -11,7 +11,7 @@ from config import (
     STAGE_NAMES, STAGE_ICONS, STAGE_FILES, STAGE_MIN_SAMPLES,
     STAGE1_Z, STAGE2_Z, STAGE3_Z, STAGE4_Z,
     KL_WARMUP_START, KL_WARMUP_END, KL_FINAL_BETA,
-    TRAINING_EPOCHS, TRAINING_LR, NOISE_FACTOR,
+    TRAINING_EPOCHS, TRAINING_LR, NOISE_FACTOR, SHARPNESS_WEIGHT,
 )
 from model import HeadVAE, ConditionalVAE, staged_loss, kl_beta_schedule, add_noise
 
@@ -536,41 +536,63 @@ class MainMenu(tk.Frame):
                         pass
 
                 optimizer = optim.Adam(model.parameters(), lr=TRAINING_LR)
+                scheduler = optim.lr_scheduler.CosineAnnealingLR(
+                    optimizer, T_max=TRAINING_EPOCHS, eta_min=TRAINING_LR * 0.05,
+                )
+
+                n_samples = target_tensor.shape[0]
+                batch_size = min(32, n_samples)
 
                 for epoch in range(1, TRAINING_EPOCHS + 1):
                     if cancel_var["cancelled"]:
                         break
 
-                    optimizer.zero_grad()
+                    model.train()
 
-                    # Denoising augmentation
-                    noisy_target = add_noise(target_tensor, noise_factor=NOISE_FACTOR)
+                    # Shuffle data each epoch
+                    perm = torch.randperm(n_samples)
+                    epoch_loss = 0.0
+                    n_batches = 0
 
-                    # Forward pass
-                    if stage == 1:
-                        recon, mu, logvar = model(noisy_target)
-                    else:
-                        recon, mu, logvar = model(noisy_target, base_tensor)
+                    for start in range(0, n_samples, batch_size):
+                        idx = perm[start:start + batch_size]
+                        batch_target = target_tensor[idx]
+                        batch_base = base_tensor[idx]
 
-                    # Loss with KL annealing
-                    beta = kl_beta_schedule(
-                        epoch, KL_WARMUP_START, KL_WARMUP_END, KL_FINAL_BETA,
-                    )
-                    # Stage 1 has no base — all pixels are "new", so equal
-                    # weighting prevents over-filling. Stages 2-4 upweight
-                    # new pixels to focus on the added component.
-                    npw = 1.0 if stage == 1 else 2.0
-                    loss = staged_loss(
-                        recon, target_tensor, base_tensor, mu, logvar, beta,
-                        new_pixel_weight=npw,
-                    )
+                        optimizer.zero_grad()
 
-                    loss.backward()
-                    optimizer.step()
+                        # Denoising augmentation
+                        noisy_target = add_noise(batch_target, noise_factor=NOISE_FACTOR)
+
+                        # Forward pass
+                        if stage == 1:
+                            recon, mu, logvar = model(noisy_target)
+                        else:
+                            recon, mu, logvar = model(noisy_target, batch_base)
+
+                        # Loss with KL annealing
+                        beta = kl_beta_schedule(
+                            epoch, KL_WARMUP_START, KL_WARMUP_END, KL_FINAL_BETA,
+                        )
+                        npw = 1.0 if stage == 1 else 2.0
+                        loss = staged_loss(
+                            recon, batch_target, batch_base, mu, logvar, beta,
+                            new_pixel_weight=npw,
+                            sharpness_weight=SHARPNESS_WEIGHT,
+                        )
+
+                        loss.backward()
+                        torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+                        optimizer.step()
+
+                        epoch_loss += loss.item()
+                        n_batches += 1
+
+                    scheduler.step()
 
                     # Update UI periodically
                     if epoch % 5 == 0 or epoch == 1:
-                        avg_loss = loss.item() / len(aug_targets)
+                        avg_loss = epoch_loss / n_batches
                         try:
                             modal.after(0, lambda e=epoch, l=avg_loss, b=beta: _update_ui(e, l, b))
                         except Exception:

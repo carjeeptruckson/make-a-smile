@@ -6,8 +6,7 @@ from config import STAGE1_Z, STAGE2_Z, STAGE3_Z, STAGE4_Z
 class HeadVAE(nn.Module):
     """Stage 1: Unconditional VAE for head shape generation.
 
-    Architecture: 256 -> 32 -> 16 -> (mu:4, logvar:4) / 4 -> 16 -> 32 -> 256
-    ~18,000 parameters total.
+    Architecture: 256 -> 128 -> 64 -> (mu:4, logvar:4) / 4 -> 64 -> 128 -> 256
     """
 
     def __init__(self):
@@ -15,19 +14,23 @@ class HeadVAE(nn.Module):
         z_dim = STAGE1_Z
 
         # Encoder
-        self.enc1 = nn.Linear(256, 32)
-        self.enc2 = nn.Linear(32, 16)
-        self.fc_mu = nn.Linear(16, z_dim)
-        self.fc_logvar = nn.Linear(16, z_dim)
+        self.enc1 = nn.Linear(256, 128)
+        self.bn1 = nn.BatchNorm1d(128)
+        self.enc2 = nn.Linear(128, 64)
+        self.bn2 = nn.BatchNorm1d(64)
+        self.fc_mu = nn.Linear(64, z_dim)
+        self.fc_logvar = nn.Linear(64, z_dim)
 
         # Decoder
-        self.dec1 = nn.Linear(z_dim, 16)
-        self.dec2 = nn.Linear(16, 32)
-        self.dec3 = nn.Linear(32, 256)
+        self.dec1 = nn.Linear(z_dim, 64)
+        self.bn3 = nn.BatchNorm1d(64)
+        self.dec2 = nn.Linear(64, 128)
+        self.bn4 = nn.BatchNorm1d(128)
+        self.dec3 = nn.Linear(128, 256)
 
     def encode(self, x):
-        h = torch.relu(self.enc1(x))
-        h = torch.relu(self.enc2(h))
+        h = torch.relu(self.bn1(self.enc1(x)))
+        h = torch.relu(self.bn2(self.enc2(h)))
         return self.fc_mu(h), self.fc_logvar(h)
 
     def reparameterize(self, mu, logvar):
@@ -36,8 +39,8 @@ class HeadVAE(nn.Module):
         return mu + eps * std
 
     def decode(self, z):
-        h = torch.relu(self.dec1(z))
-        h = torch.relu(self.dec2(h))
+        h = torch.relu(self.bn3(self.dec1(z)))
+        h = torch.relu(self.bn4(self.dec2(h)))
         return torch.sigmoid(self.dec3(h))
 
     def forward(self, x):
@@ -50,9 +53,9 @@ class HeadVAE(nn.Module):
 class ConditionalVAE(nn.Module):
     """Stages 2-4: Conditional VAE that conditions on previous stage output.
 
-    Encoder:  256 (target) -> 32 -> (mu:3, logvar:3)
-    Decoder:  (3 z + 256 condition) = 259 -> 32 -> 256
-    ~26,000 parameters total per stage.
+    Encoder:  256 (target) -> 64 -> (mu:3, logvar:3)
+    Decoder:  (3 z + 256 condition) = 259 -> 64 -> 256
+    ~34,000 parameters total per stage.
     """
 
     STAGE_Z = {
@@ -67,13 +70,13 @@ class ConditionalVAE(nn.Module):
         z_dim = self.STAGE_Z.get(stage_name, 3)
 
         # Encoder — encodes the full target image
-        self.enc1 = nn.Linear(256, 32)
-        self.fc_mu = nn.Linear(32, z_dim)
-        self.fc_logvar = nn.Linear(32, z_dim)
+        self.enc1 = nn.Linear(256, 64)
+        self.fc_mu = nn.Linear(64, z_dim)
+        self.fc_logvar = nn.Linear(64, z_dim)
 
         # Decoder — takes z concatenated with the condition (base image)
-        self.dec1 = nn.Linear(z_dim + 256, 32)
-        self.dec2 = nn.Linear(32, 256)
+        self.dec1 = nn.Linear(z_dim + 256, 64)
+        self.dec2 = nn.Linear(64, 256)
 
     def encode(self, x):
         h = torch.relu(self.enc1(x))
@@ -118,13 +121,12 @@ def sharpening_loss(output):
 
 
 def staged_loss(recon, target, base_image, mu, logvar, beta,
-                new_pixel_weight=2.0, sharpness_weight=0.5):
-    """Loss function for staged training with pixel weighting and sharpening.
+                new_pixel_weight=2.0, sharpness_weight=0.15):
+    """Loss function for staged training with pixel weighting.
 
     New pixels (present in target but not in base) are weighted higher so the
     model focuses on learning the new layer rather than simply copying the base.
-    An additional sharpening term penalizes uncertain (near 0.5) outputs to
-    produce crisp 1-pixel features.
+    An optional sharpening term penalizes uncertain (near 0.5) outputs.
 
     Args:
         recon: Reconstructed image tensor (batch, 256)
@@ -143,7 +145,7 @@ def staged_loss(recon, target, base_image, mu, logvar, beta,
     base_flat = base_image.view(-1, 256)
     recon_flat = recon.view(-1, 256)
 
-    # Per-pixel BCE loss
+    # Per-pixel BCE loss (mean reduction for stability across batch sizes)
     bce = nn.functional.binary_cross_entropy(recon_flat, target_flat, reduction='none')
 
     # Pixel weight mask: new pixels (in target but not in base) get higher weight
@@ -151,13 +153,13 @@ def staged_loss(recon, target, base_image, mu, logvar, beta,
     weight_mask = torch.ones_like(bce)
     weight_mask[new_pixels] = new_pixel_weight
 
-    weighted_bce = (bce * weight_mask).sum()
+    weighted_bce = (bce * weight_mask).mean()
 
-    # KL divergence
-    kld = -0.5 * torch.sum(1 + logvar - mu.pow(2) - logvar.exp())
+    # KL divergence (mean over batch)
+    kld = -0.5 * torch.mean(1 + logvar - mu.pow(2) - logvar.exp())
 
     # Sharpening: penalize outputs near 0.5 to encourage binary-like values
-    sharp = sharpening_loss(recon_flat) * recon_flat.shape[0] * 256
+    sharp = sharpening_loss(recon_flat)
 
     return weighted_bce + beta * kld + sharpness_weight * sharp
 
