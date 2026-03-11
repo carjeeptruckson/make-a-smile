@@ -11,7 +11,7 @@ from config import (
     STAGE_NAMES, STAGE_ICONS, STAGE_FILES, STAGE_MIN_SAMPLES,
     STAGE1_Z, STAGE2_Z, STAGE3_Z, STAGE4_Z,
     KL_WARMUP_START, KL_WARMUP_END, KL_FINAL_BETA,
-    TRAINING_EPOCHS, TRAINING_LR,
+    TRAINING_EPOCHS, TRAINING_LR, NOISE_FACTOR,
 )
 from model import HeadVAE, ConditionalVAE, staged_loss, kl_beta_schedule, add_noise
 
@@ -153,11 +153,35 @@ class MainMenu(tk.Frame):
         )
         train_btn.pack(side="right")
 
+        # Preview / Refine buttons (shown when model is trained)
+        extras_row = tk.Frame(card, bg=CLR_BG)
+        extras_row.pack(fill="x", pady=(4, 0))
+
+        preview_btn = tk.Button(
+            extras_row, text="🔍 Preview", font=("SF Pro", 9),
+            fg=CLR_TEXT_SECONDARY, bg=CLR_BG_HOVER,
+            relief="solid", bd=1, padx=6, pady=2, cursor="hand2",
+            highlightbackground=CLR_BORDER,
+            command=lambda s=stage: self._preview_stage(s),
+        )
+        preview_btn.pack(side="left", padx=(0, 4))
+
+        refine_btn = tk.Button(
+            extras_row, text="🛠 Refine", font=("SF Pro", 9),
+            fg=CLR_TEXT_SECONDARY, bg=CLR_BG_HOVER,
+            relief="solid", bd=1, padx=6, pady=2, cursor="hand2",
+            highlightbackground=CLR_BORDER,
+            command=lambda s=stage: self._refine_stage(s),
+        )
+        refine_btn.pack(side="left")
+
         self.stage_cards[stage] = {
             "progress_var": progress_var,
             "status_text": status_text,
             "status_indicator": status_indicator,
             "train_btn": train_btn,
+            "preview_btn": preview_btn,
+            "refine_btn": refine_btn,
         }
 
     def _build_action_card(self, parent, stage, info):
@@ -296,6 +320,15 @@ class MainMenu(tk.Frame):
                 fg=CLR_BG if can_train else CLR_TEXT_MUTED,
             )
 
+            # Preview / Refine buttons: only if model trained
+            has_model = self._stage_model_exists(stage)
+            for btn_key in ("preview_btn", "refine_btn"):
+                card[btn_key].config(
+                    state="normal" if has_model else "disabled",
+                    fg=CLR_TEXT_SECONDARY if has_model else CLR_TEXT_MUTED,
+                    bg=CLR_BG_HOVER if has_model else CLR_BG,
+                )
+
         # Update action cards
         for child in self.winfo_children():
             self._update_action_cards_recursive(child)
@@ -345,6 +378,20 @@ class MainMenu(tk.Frame):
             )
             return
         self.controller.show_drawer(stage)
+
+    def _preview_stage(self, stage):
+        """Open the generator with only this stage's model loaded for preview."""
+        if not self._stage_model_exists(stage):
+            messagebox.showinfo("No Model", f"Train Stage {stage} first.")
+            return
+        self.controller.show_generator()
+
+    def _refine_stage(self, stage):
+        """Open the refine studio focused on a specific stage."""
+        if not self._stage_model_exists(stage):
+            messagebox.showinfo("No Model", f"Train Stage {stage} first.")
+            return
+        self.controller.show_refine()
 
     # ── Training ────────────────────────────────────────────────
 
@@ -497,7 +544,7 @@ class MainMenu(tk.Frame):
                     optimizer.zero_grad()
 
                     # Denoising augmentation
-                    noisy_target = add_noise(target_tensor, noise_factor=0.1)
+                    noisy_target = add_noise(target_tensor, noise_factor=NOISE_FACTOR)
 
                     # Forward pass
                     if stage == 1:
@@ -509,8 +556,13 @@ class MainMenu(tk.Frame):
                     beta = kl_beta_schedule(
                         epoch, KL_WARMUP_START, KL_WARMUP_END, KL_FINAL_BETA,
                     )
+                    # Stage 1 has no base — all pixels are "new", so equal
+                    # weighting prevents over-filling. Stages 2-4 upweight
+                    # new pixels to focus on the added component.
+                    npw = 1.0 if stage == 1 else 2.0
                     loss = staged_loss(
                         recon, target_tensor, base_tensor, mu, logvar, beta,
+                        new_pixel_weight=npw,
                     )
 
                     loss.backward()

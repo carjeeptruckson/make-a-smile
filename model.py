@@ -98,11 +98,33 @@ class ConditionalVAE(nn.Module):
         return recon, mu, logvar
 
 
-def staged_loss(recon, target, base_image, mu, logvar, beta, new_pixel_weight=2.0):
-    """Loss function for staged training with pixel weighting.
+def sharpening_loss(output):
+    """Penalizes outputs near 0.5, encouraging crisp binary values.
+
+    This computes the negative binary entropy of each pixel. Pixels at 0.5
+    (maximum uncertainty) get the highest penalty; pixels near 0 or 1 get
+    near-zero penalty. This prevents the "thick wall" problem where the
+    model produces soft/smeared edges.
+
+    Returns:
+        Mean sharpening penalty (scalar, higher = more uncertain outputs)
+    """
+    eps = 1e-7
+    clamped = output.clamp(eps, 1.0 - eps)
+    # Binary entropy: H = -(p*log(p) + (1-p)*log(1-p))
+    # This is maximized at p=0.5 (= 0.693) and 0 at p=0 or p=1
+    entropy = -(clamped * torch.log(clamped) + (1 - clamped) * torch.log(1 - clamped))
+    return entropy.mean()
+
+
+def staged_loss(recon, target, base_image, mu, logvar, beta,
+                new_pixel_weight=2.0, sharpness_weight=0.5):
+    """Loss function for staged training with pixel weighting and sharpening.
 
     New pixels (present in target but not in base) are weighted higher so the
     model focuses on learning the new layer rather than simply copying the base.
+    An additional sharpening term penalizes uncertain (near 0.5) outputs to
+    produce crisp 1-pixel features.
 
     Args:
         recon: Reconstructed image tensor (batch, 256)
@@ -112,6 +134,7 @@ def staged_loss(recon, target, base_image, mu, logvar, beta, new_pixel_weight=2.
         logvar: Latent log-variance (batch, z_dim)
         beta: KL divergence weight (from annealing schedule)
         new_pixel_weight: Extra weight for newly drawn pixels (default 2.0)
+        sharpness_weight: How strongly to penalize soft/uncertain pixels
 
     Returns:
         Total loss (scalar)
@@ -133,7 +156,10 @@ def staged_loss(recon, target, base_image, mu, logvar, beta, new_pixel_weight=2.
     # KL divergence
     kld = -0.5 * torch.sum(1 + logvar - mu.pow(2) - logvar.exp())
 
-    return weighted_bce + beta * kld
+    # Sharpening: penalize outputs near 0.5 to encourage binary-like values
+    sharp = sharpening_loss(recon_flat) * recon_flat.shape[0] * 256
+
+    return weighted_bce + beta * kld + sharpness_weight * sharp
 
 
 def kl_beta_schedule(epoch, warmup_start=100, warmup_end=400, final_beta=0.8):
@@ -153,8 +179,12 @@ def kl_beta_schedule(epoch, warmup_start=100, warmup_end=400, final_beta=0.8):
         return final_beta
 
 
-def add_noise(img_tensor, noise_factor=0.1):
-    """Denoising augmentation: randomly flips a fraction of pixels during training."""
+def add_noise(img_tensor, noise_factor=0.03):
+    """Denoising augmentation: randomly flips a fraction of pixels during training.
+
+    Default 3% — flips ~8 pixels per 16×16 image. Higher values (e.g. 10%)
+    cause wall-thickening artifacts on thin 1-pixel features.
+    """
     noise = torch.rand_like(img_tensor)
     noisy_img = torch.where(noise < noise_factor, 1.0 - img_tensor, img_tensor)
     return noisy_img

@@ -8,7 +8,7 @@ import random
 import threading
 import numpy as np
 from config import (
-    GRID_SIZE, CELL_SIZE,
+    GRID_SIZE, CELL_SIZE, RENDER_THRESHOLD,
     STAGE_NAMES, STAGE_ICONS, STAGE_FILES, STAGE_MIN_SAMPLES,
     STAGE1_Z, STAGE2_Z, STAGE3_Z, STAGE4_Z,
     TRAINING_LR,
@@ -35,7 +35,7 @@ STAGE_Z_DIMS = {1: STAGE1_Z, 2: STAGE2_Z, 3: STAGE3_Z, 4: STAGE4_Z}
 # Display scaling
 DISPLAY_SIZE = 400
 PIXEL_SIZE = DISPLAY_SIZE // GRID_SIZE
-REFINE_STEPS = 18
+REFINE_STEPS = 60
 
 
 class RefineUI(tk.Frame):
@@ -112,8 +112,9 @@ class RefineUI(tk.Frame):
                 x1, y1 = x * PIXEL_SIZE, y * PIXEL_SIZE
                 x2, y2 = x1 + PIXEL_SIZE, y1 + PIXEL_SIZE
                 self.rects[y][x] = self.canvas.create_rectangle(
-                    x1, y1, x2, y2, fill=CLR_BG, outline="",
+                    x1, y1, x2, y2, fill=CLR_BG, outline="#E5E7EB",
                 )
+        self.canvas.config(cursor="crosshair")
 
         # Drawing binds
         self.canvas.bind("<Button-1>", lambda e: self._paint(e, 1))
@@ -284,7 +285,7 @@ class RefineUI(tk.Frame):
                 else:
                     if current_img is None:
                         break
-                    condition = (current_img > 0.5).float()
+                    condition = (current_img > RENDER_THRESHOLD).float()
                     current_img = model.decode(z, condition)
 
             self.current_face_imgs[stage] = current_img.clone()
@@ -297,7 +298,7 @@ class RefineUI(tk.Frame):
         """Render a 16×16 array to the canvas."""
         for y in range(GRID_SIZE):
             for x in range(GRID_SIZE):
-                color = CLR_DRAW_PIXEL if img_array[y][x] > 0.5 else CLR_BG
+                color = CLR_DRAW_PIXEL if img_array[y][x] > RENDER_THRESHOLD else CLR_BG
                 self.canvas.itemconfig(self.rects[y][x], fill=color)
 
     def _update_counters(self):
@@ -330,7 +331,7 @@ class RefineUI(tk.Frame):
         """Save the current face's layers to training data for all stages."""
         for stage in sorted(self.current_face_imgs.keys()):
             base_path, target_path, _ = STAGE_FILES[stage]
-            target_data = (self.current_face_imgs[stage] > 0.5).float()
+            target_data = (self.current_face_imgs[stage] > RENDER_THRESHOLD).float()
             target_flat = target_data.view(-1).tolist()
             target_int = [int(v) for v in target_flat]
 
@@ -342,7 +343,7 @@ class RefineUI(tk.Frame):
                     # Get base from previous stage
                     prev_stage = stage - 1
                     if prev_stage in self.current_face_imgs:
-                        base_data = (self.current_face_imgs[prev_stage] > 0.5).float()
+                        base_data = (self.current_face_imgs[prev_stage] > RENDER_THRESHOLD).float()
                         base_flat = [int(v) for v in base_data.view(-1).tolist()]
                     else:
                         base_flat = [0] * 256
@@ -375,19 +376,36 @@ class RefineUI(tk.Frame):
         # Set up base layer = output of stage before the one we're fixing
         prev_stage = stage - 1
         if prev_stage >= 1 and prev_stage in self.current_face_imgs:
-            base_img = (self.current_face_imgs[prev_stage] > 0.5).float()
+            base_img = (self.current_face_imgs[prev_stage] > RENDER_THRESHOLD).float()
         else:
             base_img = torch.zeros(1, 256)
 
         base_np = base_img.view(GRID_SIZE, GRID_SIZE).numpy()
-        self.base_data = [[int(base_np[y][x] > 0.5) for x in range(GRID_SIZE)]
+        self.base_data = [[int(base_np[y][x] > RENDER_THRESHOLD) for x in range(GRID_SIZE)]
                           for y in range(GRID_SIZE)]
-        self.grid_data = [[0] * GRID_SIZE for _ in range(GRID_SIZE)]
 
-        # Render base in blue, clear edit layer
+        # Pre-fill grid_data with the AI's current output for this stage
+        # so the user can SEE and correct what the AI generated
+        if stage in self.current_face_imgs:
+            stage_img = (self.current_face_imgs[stage] > RENDER_THRESHOLD).float()
+            stage_np = stage_img.view(GRID_SIZE, GRID_SIZE).numpy()
+            self.grid_data = [
+                [int(stage_np[y][x] > RENDER_THRESHOLD and self.base_data[y][x] == 0)
+                 for x in range(GRID_SIZE)]
+                for y in range(GRID_SIZE)
+            ]
+        else:
+            self.grid_data = [[0] * GRID_SIZE for _ in range(GRID_SIZE)]
+
+        # Render: base in blue, AI's new pixels in dark gray, empty in white
         for y in range(GRID_SIZE):
             for x in range(GRID_SIZE):
-                color = CLR_BASE_PIXEL if self.base_data[y][x] == 1 else CLR_BG
+                if self.base_data[y][x] == 1:
+                    color = CLR_BASE_PIXEL
+                elif self.grid_data[y][x] == 1:
+                    color = CLR_DRAW_PIXEL
+                else:
+                    color = CLR_BG
                 self.canvas.itemconfig(self.rects[y][x], fill=color)
 
     def _paint(self, event, val):
@@ -480,8 +498,35 @@ class RefineUI(tk.Frame):
                 model.train()
                 optimizer = optim.Adam(model.parameters(), lr=TRAINING_LR * 0.5)
 
-                target_tensor = torch.tensor([target_flat], dtype=torch.float32)
-                base_tensor = torch.tensor([base_flat], dtype=torch.float32)
+                # Load ALL training data for this stage (not just the single correction)
+                all_targets = []
+                all_bases = []
+                base_file, target_file, _ = STAGE_FILES[stage]
+
+                if os.path.exists(target_file):
+                    with open(target_file, "r") as f:
+                        for row in csv.reader(f):
+                            if len(row) == 256:
+                                all_targets.append([float(v) for v in row])
+
+                if stage > 1 and base_file and os.path.exists(base_file):
+                    with open(base_file, "r") as f:
+                        for row in csv.reader(f):
+                            if len(row) == 256:
+                                all_bases.append([float(v) for v in row])
+
+                if not all_targets:
+                    # Fallback: just use the single correction
+                    all_targets = [target_flat]
+                    all_bases = [base_flat]
+
+                target_tensor = torch.tensor(all_targets, dtype=torch.float32)
+                if stage == 1:
+                    base_tensor = torch.zeros_like(target_tensor)
+                elif all_bases:
+                    base_tensor = torch.tensor(all_bases, dtype=torch.float32)
+                else:
+                    base_tensor = torch.zeros_like(target_tensor)
 
                 for step in range(1, REFINE_STEPS + 1):
                     optimizer.zero_grad()
@@ -490,14 +535,14 @@ class RefineUI(tk.Frame):
                     else:
                         recon, mu, logvar = model(target_tensor, base_tensor)
 
-                    loss = staged_loss(recon, target_tensor, base_tensor, mu, logvar, beta=0.5)
+                    loss = staged_loss(recon, target_tensor, base_tensor, mu, logvar, beta=0.3)
                     loss.backward()
                     optimizer.step()
 
-                    if step % 3 == 0:
+                    if step % 5 == 0:
                         try:
                             self.after(0, lambda s=step: self.train_status_label.config(
-                                text=f"Training... {s}/{REFINE_STEPS} steps"
+                                text=f"Refining on {len(all_targets)} samples... {s}/{REFINE_STEPS}"
                             ))
                         except Exception:
                             break
@@ -543,7 +588,7 @@ class RefineUI(tk.Frame):
                 else:
                     if current_img is None:
                         break
-                    condition = (current_img > 0.5).float()
+                    condition = (current_img > RENDER_THRESHOLD).float()
                     current_img = model.decode(z, condition)
 
             self.current_face_imgs[stage] = current_img.clone()

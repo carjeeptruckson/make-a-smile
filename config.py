@@ -41,11 +41,18 @@ STAGE_MIN_SAMPLES = {
 }
 
 # Training hyperparameters
-KL_WARMUP_START = 100
-KL_WARMUP_END = 400
-KL_FINAL_BETA = 0.8
-TRAINING_EPOCHS = 500
-TRAINING_LR = 1e-3
+KL_WARMUP_START = 150
+KL_WARMUP_END = 600
+KL_FINAL_BETA = 0.3
+TRAINING_EPOCHS = 800
+TRAINING_LR = 5e-4
+NOISE_FACTOR = 0.03
+SHARPNESS_WEIGHT = 0.15
+
+# Rendering: threshold for binarizing sigmoid outputs
+# With sharpening loss, the model produces crisp 0-or-1 outputs,
+# so 0.5 works well. Only raise this if outputs are still soft.
+RENDER_THRESHOLD = 0.5
 
 # Stage metadata (for UI labels)
 STAGE_NAMES = {

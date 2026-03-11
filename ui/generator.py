@@ -5,7 +5,7 @@ import random
 import threading
 import os
 from config import (
-    GRID_SIZE, CELL_SIZE,
+    GRID_SIZE, CELL_SIZE, RENDER_THRESHOLD,
     STAGE1_Z, STAGE2_Z, STAGE3_Z, STAGE4_Z,
     STAGE_NAMES, STAGE_ICONS, STAGE_FILES,
 )
@@ -283,7 +283,7 @@ class GeneratorUI(tk.Frame):
                             if current_img is None:
                                 break
                             # Binarize the condition for cleaner conditioning
-                            condition = (current_img > 0.5).float()
+                            condition = (current_img > RENDER_THRESHOLD).float()
                             current_img = model.decode(z_tensor, condition)
 
                 if current_img is not None:
@@ -302,7 +302,7 @@ class GeneratorUI(tk.Frame):
         """Render a 16×16 numpy array to the canvas."""
         for y in range(GRID_SIZE):
             for x in range(GRID_SIZE):
-                color = CLR_DRAW_PIXEL if img_array[y][x] > 0.5 else CLR_BG
+                color = CLR_DRAW_PIXEL if img_array[y][x] > RENDER_THRESHOLD else CLR_BG
                 self.canvas.itemconfig(self.rects[y][x], fill=color)
 
     # ── Morph animation ─────────────────────────────────────────
