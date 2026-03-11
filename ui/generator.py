@@ -1,16 +1,23 @@
 import tkinter as tk
 from tkinter import ttk
 import torch
+import torch.optim as optim
+import csv
 import random
 import threading
+import numpy as np
 import os
 from config import (
     GRID_SIZE, CELL_SIZE, RENDER_THRESHOLD,
     STAGE1_Z, STAGE2_Z, STAGE3_Z, STAGE4_Z,
     STAGE_NAMES, STAGE_ICONS, STAGE_FILES,
-    REJECTION_SAMPLE_COUNT,
+    REJECTION_SAMPLE_COUNT, TRAINING_LR,
+    CONNECTIVITY_WEIGHT, SHARPNESS_WEIGHT,
 )
-from model import HeadVAE, ConditionalVAE, score_structural_quality
+from model import (
+    HeadVAE, ConditionalVAE, score_structural_quality,
+    flood_fill_gap_score, staged_loss,
+)
 
 # Design system colors
 CLR_PRIMARY = "#3B82F6"
@@ -42,6 +49,8 @@ class GeneratorUI(tk.Frame):
         self.slider_widgets = {}  # stage_num -> list of (slider, value_label)
         self._debounce_id = None
         self._generating = False
+        self._training = False
+        self._current_stage_imgs = {}  # stage -> tensor, last generated
 
         self._build_ui()
 
@@ -113,6 +122,16 @@ class GeneratorUI(tk.Frame):
             command=self._randomize_all,
         ).pack(side="left", padx=8)
 
+        self.fix_btn = tk.Button(
+            btn_frame, text="🔧 Fix Gaps & Train", font=("SF Pro", 12, "bold"),
+            fg=CLR_BG, bg="#10B981", activebackground="#059669",
+            activeforeground=CLR_BG,
+            relief="solid", bd=1, padx=16, pady=8, cursor="hand2",
+            highlightbackground="#10B981",
+            command=self._fix_gaps_and_train,
+        )
+        self.fix_btn.pack(side="left", padx=8)
+
         tk.Button(
             btn_frame, text="✨ Morph", font=("SF Pro", 12),
             fg=CLR_TEXT, bg=CLR_BG, relief="solid", bd=1,
@@ -128,6 +147,13 @@ class GeneratorUI(tk.Frame):
             highlightbackground=CLR_BORDER,
             command=self.controller.show_menu,
         ).pack(side="left", padx=8)
+
+        # Status label for auto-training feedback
+        self.status_label = tk.Label(
+            self, text="", font=("SF Pro", 11, "bold"),
+            fg="#10B981", bg=CLR_BG,
+        )
+        self.status_label.pack(pady=2)
 
     # ── Model loading ───────────────────────────────────────────
 
@@ -296,6 +322,7 @@ class GeneratorUI(tk.Frame):
         def do_generate():
             try:
                 current_img = None
+                stage_imgs = {}
 
                 for stage in sorted(self.models.keys()):
                     # Get z values from sliders
@@ -313,6 +340,10 @@ class GeneratorUI(tk.Frame):
                             # Binarize the condition for cleaner conditioning
                             condition = (current_img > RENDER_THRESHOLD).float()
                             current_img = model.decode(z_tensor, condition)
+
+                    stage_imgs[stage] = current_img.clone()
+
+                self._current_stage_imgs = stage_imgs
 
                 if current_img is not None:
                     img_np = current_img.view(GRID_SIZE, GRID_SIZE).numpy()
@@ -363,3 +394,224 @@ class GeneratorUI(tk.Frame):
                 self.after(60, lambda: step_morph(current_step + 1))
 
         step_morph(0)
+
+    # ── Auto gap-fix and train ───────────────────────────────────
+
+    @staticmethod
+    def _fill_gaps_from_center(binary_np):
+        """Fill 1-2 pixel gaps in a head outline.
+
+        Flood fills from center to find the leak path, then from the border
+        inward to find which leak-path pixels are closest to the outline.
+        Those pixels at the narrowest point of the gap get filled.
+        """
+        gs = GRID_SIZE
+        filled = binary_np.copy()
+        center = gs // 2
+
+        def flood_from(sy, sx, grid):
+            """BFS from (sy,sx) through empty pixels. Returns (visited, dist)."""
+            visited = np.zeros((gs, gs), dtype=bool)
+            dist = np.full((gs, gs), -1, dtype=int)
+            queue = [(sy, sx)]
+            visited[sy, sx] = True
+            dist[sy, sx] = 0
+            while queue:
+                y, x = queue.pop(0)
+                for dy, dx in [(-1,0),(1,0),(0,-1),(0,1)]:
+                    ny, nx = y+dy, x+dx
+                    if 0 <= ny < gs and 0 <= nx < gs and not visited[ny,nx] and not grid[ny,nx]:
+                        visited[ny,nx] = True
+                        dist[ny,nx] = dist[y,x] + 1
+                        queue.append((ny, nx))
+            return visited, dist
+
+        for _ in range(4):  # Max 4 fill attempts
+            center_vis, center_dist = flood_from(center, center, filled)
+
+            # Check for border leaks
+            border_leaks = []
+            for y in range(gs):
+                for x in range(gs):
+                    if (y == 0 or y == gs-1 or x == 0 or x == gs-1) and center_vis[y, x]:
+                        border_leaks.append((y, x))
+            if not border_leaks:
+                break
+
+            # BFS from all border leak pixels inward
+            border_dist = np.full((gs, gs), -1, dtype=int)
+            border_vis = np.zeros((gs, gs), dtype=bool)
+            queue = []
+            for by, bx in border_leaks:
+                border_vis[by, bx] = True
+                border_dist[by, bx] = 0
+                queue.append((by, bx))
+            while queue:
+                y, x = queue.pop(0)
+                for dy, dx in [(-1,0),(1,0),(0,-1),(0,1)]:
+                    ny, nx = y+dy, x+dx
+                    if 0 <= ny < gs and 0 <= nx < gs and not border_vis[ny,nx] and not filled[ny,nx]:
+                        border_vis[ny,nx] = True
+                        border_dist[ny,nx] = border_dist[y,x] + 1
+                        queue.append((ny, nx))
+
+            # The gap narrows where center_dist + border_dist is minimized.
+            # Find empty pixels on the leak path (reachable from both center
+            # and border) that are adjacent to outline pixels.
+            best = None
+            best_score = float('inf')
+            for y in range(1, gs-1):
+                for x in range(1, gs-1):
+                    if filled[y, x] or center_dist[y, x] < 0 or border_dist[y, x] < 0:
+                        continue
+                    # Must be adjacent to at least 1 outline pixel
+                    adj = sum(
+                        1 for dy, dx in [(-1,0),(1,0),(0,-1),(0,1)]
+                        if filled[y+dy, x+dx]
+                    )
+                    if adj < 1:
+                        continue
+                    # Score: total path length through this pixel (lower = narrower gap)
+                    # Break ties by preferring more outline neighbors
+                    path_len = center_dist[y, x] + border_dist[y, x]
+                    score = (path_len, -adj)
+                    if best is None or score < best_score:
+                        best_score = score
+                        best = (y, x)
+
+            if best is None:
+                break
+            filled[best[0], best[1]] = 1
+
+        return filled
+
+    def _fix_gaps_and_train(self):
+        """Auto-detect gaps in current stage-1 output, fill them, save as
+        training data, and run a mini-retrain."""
+        if 1 not in self.models or 1 not in self._current_stage_imgs:
+            self.status_label.config(text="Generate a face first", fg="#EF4444")
+            return
+        if self._training:
+            return
+
+        stage1_img = self._current_stage_imgs[1]
+        binary = (stage1_img > RENDER_THRESHOLD).float()
+        binary_np = binary.view(GRID_SIZE, GRID_SIZE).numpy().astype(np.uint8)
+
+        # Check if there are gaps
+        gap_score = flood_fill_gap_score(stage1_img)
+        if gap_score.item() == 0:
+            self.status_label.config(text="No gaps detected!", fg=CLR_PRIMARY)
+            self.after(2000, lambda: self.status_label.config(text=""))
+            return
+
+        # Fill the gaps
+        fixed_np = self._fill_gaps_from_center(binary_np)
+        fixed_flat = fixed_np.flatten().tolist()
+        fixed_int = [int(v) for v in fixed_flat]
+
+        # Save the corrected face to training data
+        _, target_path, model_path = STAGE_FILES[1]
+        try:
+            with open(target_path, "a", newline="") as f:
+                csv.writer(f).writerow(fixed_int)
+            # Also save the horizontally flipped version
+            flipped = np.fliplr(fixed_np).flatten().tolist()
+            with open(target_path, "a", newline="") as f:
+                csv.writer(f).writerow([int(v) for v in flipped])
+        except Exception as e:
+            self.status_label.config(text=f"Save failed: {e}", fg="#EF4444")
+            return
+
+        # Show the fixed version immediately
+        self._current_stage_imgs[1] = torch.tensor(
+            fixed_np.reshape(1, -1), dtype=torch.float32,
+        )
+        # Re-render with the fixed image visible at stage 1
+        final_stage = max(self._current_stage_imgs.keys())
+        if final_stage == 1:
+            self._render_face(fixed_np.astype(float))
+        else:
+            # Regenerate stages 2+ with the fixed base
+            self._generate_face()
+
+        self.status_label.config(text="Gap fixed! Training...", fg="#10B981")
+        self._training = True
+
+        def do_auto_train():
+            try:
+                model = self.models[1]
+                model.train()
+
+                # Load all stage 1 training data
+                all_targets = []
+                _, target_file, _ = STAGE_FILES[1]
+                if os.path.exists(target_file):
+                    with open(target_file, "r") as f:
+                        for row in csv.reader(f):
+                            if len(row) == 256:
+                                all_targets.append([float(v) for v in row])
+
+                if not all_targets:
+                    return
+
+                target_tensor = torch.tensor(all_targets, dtype=torch.float32)
+                base_tensor = torch.zeros_like(target_tensor)
+
+                optimizer = optim.Adam(model.parameters(), lr=TRAINING_LR * 0.3)
+                train_steps = 40
+
+                n_samples = target_tensor.shape[0]
+                batch_size = min(32, n_samples)
+
+                for step in range(1, train_steps + 1):
+                    perm = torch.randperm(n_samples)
+                    for start in range(0, n_samples, batch_size):
+                        idx = perm[start:start + batch_size]
+                        batch_t = target_tensor[idx]
+                        batch_b = base_tensor[idx]
+
+                        optimizer.zero_grad()
+                        recon, mu, logvar = model(batch_t)
+                        loss = staged_loss(
+                            recon, batch_t, batch_b, mu, logvar, beta=0.1,
+                            sharpness_weight=SHARPNESS_WEIGHT,
+                            connectivity_weight=CONNECTIVITY_WEIGHT,
+                        )
+                        loss.backward()
+                        torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+                        optimizer.step()
+
+                    if step % 5 == 0:
+                        try:
+                            self.after(0, lambda s=step: self.status_label.config(
+                                text=f"Training... {s}/{train_steps}",
+                            ))
+                        except Exception:
+                            break
+
+                model.eval()
+                torch.save(model.state_dict(), model_path)
+                self.models[1] = model
+
+                try:
+                    self.after(0, lambda: self.status_label.config(
+                        text="Done! Generating improved face...",
+                    ))
+                    self.after(500, self._randomize_all)
+                    self.after(2500, lambda: self.status_label.config(text=""))
+                except Exception:
+                    pass
+
+            except Exception as e:
+                try:
+                    self.after(0, lambda: self.status_label.config(
+                        text=f"Training error: {e}", fg="#EF4444",
+                    ))
+                except Exception:
+                    pass
+            finally:
+                self._training = False
+
+        thread = threading.Thread(target=do_auto_train, daemon=True)
+        thread.start()

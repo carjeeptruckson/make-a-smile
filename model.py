@@ -1,7 +1,8 @@
+import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from config import STAGE1_Z, STAGE2_Z, STAGE3_Z, STAGE4_Z
+from config import STAGE1_Z, STAGE2_Z, STAGE3_Z, STAGE4_Z, GRID_SIZE
 
 # Fixed 3x3 kernel for counting filled neighbors (center=0, surround=1/8)
 _NEIGHBOR_KERNEL = torch.tensor(
@@ -9,6 +10,21 @@ _NEIGHBOR_KERNEL = torch.tensor(
      [1, 0, 1],
      [1, 1, 1]], dtype=torch.float32
 ).reshape(1, 1, 3, 3) / 8.0
+
+# Directional kernels for opposing-pair gap detection.
+# Each pair detects an empty pixel with filled neighbors on opposite sides.
+_DIR_PAIRS = []
+for dy1, dx1, dy2, dx2 in [
+    (-1, 0, 1, 0),   # top-bottom
+    (0, -1, 0, 1),   # left-right
+    (-1, -1, 1, 1),  # top-left to bottom-right
+    (-1, 1, 1, -1),  # top-right to bottom-left
+]:
+    k1 = torch.zeros(1, 1, 3, 3)
+    k2 = torch.zeros(1, 1, 3, 3)
+    k1[0, 0, dy1 + 1, dx1 + 1] = 1.0
+    k2[0, 0, dy2 + 1, dx2 + 1] = 1.0
+    _DIR_PAIRS.append((k1, k2))
 
 
 class HeadVAE(nn.Module):
@@ -128,44 +144,90 @@ def sharpening_loss(output):
     return entropy.mean()
 
 
-def neighbor_consistency_loss(output, stray_thresh=0.2, gap_thresh=0.6):
-    """Differentiable loss penalizing stray pixels and gaps in the output.
+def neighbor_consistency_loss(output, stray_thresh=0.2):
+    """Differentiable loss penalizing stray pixels and 1-pixel gaps.
 
-    Uses conv2d with a fixed neighbor-counting kernel. Stray pixels are filled
-    pixels with very few filled neighbors; gaps are empty pixels surrounded by
-    filled ones.
+    Two components:
+    - Stray: filled pixels with very few filled neighbors
+    - Directional gap: empty pixels with filled neighbors on opposing sides
+      (e.g., filled above and below but empty in between = gap in outline).
+      This catches the 1-pixel gaps that density-based detection misses.
     """
-    out_2d = output.view(-1, 1, 16, 16)
-    kernel = _NEIGHBOR_KERNEL.to(output.device)
+    dev = output.device
+    out_2d = output.view(-1, 1, GRID_SIZE, GRID_SIZE)
+    kernel = _NEIGHBOR_KERNEL.to(dev)
     neighbor_density = F.conv2d(out_2d, kernel, padding=1)
 
     # Stray: filled pixel with low neighbor density
     stray = (out_2d * F.relu(stray_thresh - neighbor_density)).mean()
-    # Gap: empty pixel with high neighbor density
-    gap = ((1.0 - out_2d) * F.relu(neighbor_density - gap_thresh)).mean()
+
+    # Directional gap: for each of 4 opposing direction pairs, compute
+    # gap_score = (1 - pixel) * side_a * side_b
+    # This is high when pixel is empty but both opposing neighbors are filled.
+    gap = torch.zeros(1, device=dev)
+    for k1, k2 in _DIR_PAIRS:
+        side_a = F.conv2d(out_2d, k1.to(dev), padding=1)
+        side_b = F.conv2d(out_2d, k2.to(dev), padding=1)
+        gap = gap + ((1.0 - out_2d) * side_a * side_b).mean()
+
     return stray + gap
+
+
+def flood_fill_gap_score(img_tensor):
+    """Score shapes by flood-filling from center through empty pixels.
+
+    If the fill reaches the border, the shape has a gap. Returns the number
+    of border pixels reached per image (lower = more closed = better).
+    Works on binarized images. Not differentiable — used for rejection sampling.
+    """
+    batch = (img_tensor > 0.5).view(-1, GRID_SIZE, GRID_SIZE).cpu().numpy()
+    scores = []
+    center = GRID_SIZE // 2
+
+    for i in range(batch.shape[0]):
+        binary = batch[i]
+        visited = np.zeros_like(binary, dtype=bool)
+        queue = [(center, center)]
+        border_leaks = 0
+
+        while queue:
+            y, x = queue.pop()
+            if y < 0 or y >= GRID_SIZE or x < 0 or x >= GRID_SIZE:
+                continue
+            if visited[y, x] or binary[y, x]:
+                continue
+            visited[y, x] = True
+            if y == 0 or y == GRID_SIZE - 1 or x == 0 or x == GRID_SIZE - 1:
+                border_leaks += 1
+            queue.extend([(y - 1, x), (y + 1, x), (y, x - 1), (y, x + 1)])
+
+        scores.append(float(border_leaks))
+
+    return torch.tensor(scores)
 
 
 def score_structural_quality(img_tensor):
     """Score a batch of 16x16 images for structural quality (lower = better).
 
-    Used for rejection sampling during generation.
+    Combines flood-fill gap detection (catches real gaps in outlines),
+    stray pixel counting, and pixel count sanity check.
     """
     with torch.no_grad():
-        binary = (img_tensor > 0.5).float().view(-1, 1, 16, 16)
+        binary = (img_tensor > 0.5).float().view(-1, 1, GRID_SIZE, GRID_SIZE)
         kernel = _NEIGHBOR_KERNEL.to(img_tensor.device)
         neighbors = F.conv2d(binary, kernel, padding=1)
 
-        # Count stray pixels (filled with <2 of 8 neighbors → density < 0.25)
+        # Stray pixels (filled with <2 of 8 neighbors)
         stray = (binary * (neighbors < 0.25).float()).sum(dim=(1, 2, 3))
-        # Count gap pixels (empty with 5+ of 8 neighbors → density > 0.6)
-        gap = ((1.0 - binary) * (neighbors > 0.6).float()).sum(dim=(1, 2, 3))
 
-        # Pixel count penalty — heads should have ~20-150 filled pixels
+        # Flood fill from center — the primary gap detector
+        flood_score = flood_fill_gap_score(img_tensor)
+
+        # Pixel count sanity
         pixel_count = binary.sum(dim=(1, 2, 3))
         count_penalty = F.relu(20.0 - pixel_count) + F.relu(pixel_count - 150.0)
 
-        return stray + gap + count_penalty * 0.5
+        return stray + flood_score * 5.0 + count_penalty * 0.5
 
 
 def staged_loss(recon, target, base_image, mu, logvar, beta,
