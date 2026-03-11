@@ -1,129 +1,568 @@
 import tkinter as tk
-from tkinter import ttk, messagebox
+from tkinter import ttk
 import torch
 import torch.optim as optim
 import csv
-from config import GRID_SIZE, CELL_SIZE, DATA_FILE, MODEL_FILE, LATENT_DIM
-from model import VAE, loss_function
+import os
+import random
+import threading
+import numpy as np
+from config import (
+    GRID_SIZE, CELL_SIZE,
+    STAGE_NAMES, STAGE_ICONS, STAGE_FILES, STAGE_MIN_SAMPLES,
+    STAGE1_Z, STAGE2_Z, STAGE3_Z, STAGE4_Z,
+    TRAINING_LR,
+)
+from model import HeadVAE, ConditionalVAE, staged_loss
+
+# Design system colors
+CLR_PRIMARY = "#3B82F6"
+CLR_SUCCESS = "#10B981"
+CLR_WARNING = "#F59E0B"
+CLR_DANGER = "#EF4444"
+CLR_TEXT = "#111827"
+CLR_TEXT_SECONDARY = "#6B7280"
+CLR_TEXT_MUTED = "#9CA3AF"
+CLR_BORDER = "#E5E7EB"
+CLR_BG = "#FFFFFF"
+CLR_BG_LIGHT = "#F9FAFB"
+CLR_BG_HOVER = "#F3F4F6"
+CLR_BASE_PIXEL = "#BFDBFE"
+CLR_DRAW_PIXEL = "#1F2937"
+
+STAGE_Z_DIMS = {1: STAGE1_Z, 2: STAGE2_Z, 3: STAGE3_Z, 4: STAGE4_Z}
+
+# Display scaling
+DISPLAY_SIZE = 400
+PIXEL_SIZE = DISPLAY_SIZE // GRID_SIZE
+REFINE_STEPS = 18
+
 
 class RefineUI(tk.Frame):
+    """Per-component refinement studio with rating and editing."""
+
     def __init__(self, parent, controller):
-        super().__init__(parent)
+        super().__init__(parent, bg=CLR_BG)
         self.controller = controller
-        self.model = VAE()
-        
-        tk.Label(self, text="Guided Refinement Studio", font=("Helvetica", 18, "bold")).pack(pady=10)
-        
-        self.instruction_label = tk.Label(self, text="Step 1: Rate this generation", font=("Helvetica", 12, "italic"))
-        self.instruction_label.pack(pady=5)
+        self.models = {}
+        self.current_face_imgs = {}  # stage -> tensor
+        self.current_stage_fixing = None
+        self.can_draw = False
+        self.face_count = 0
+        self.saved_count = 0
 
-        # The Canvas
-        self.canvas = tk.Canvas(self, width=GRID_SIZE*CELL_SIZE, height=GRID_SIZE*CELL_SIZE, bg="white")
-        self.canvas.pack(pady=5)
+        self.grid_data = [[0] * GRID_SIZE for _ in range(GRID_SIZE)]
+        self.base_data = [[0] * GRID_SIZE for _ in range(GRID_SIZE)]
 
-        self.grid_data = [[0 for _ in range(GRID_SIZE)] for _ in range(GRID_SIZE)]
-        self.rects = [[None for _ in range(GRID_SIZE)] for _ in range(GRID_SIZE)]
+        self._build_ui()
 
+    def _build_ui(self):
+        # ── Header ──────────────────────────────────────────────
+        header = tk.Frame(self, bg=CLR_BG, pady=12)
+        header.pack(fill="x")
+
+        tk.Label(
+            header, text="Refine Your Face",
+            font=("SF Pro", 24, "bold"), fg=CLR_TEXT, bg=CLR_BG,
+        ).pack()
+        tk.Label(
+            header, text="Rate and improve specific features",
+            font=("SF Pro", 12), fg=CLR_TEXT_SECONDARY, bg=CLR_BG,
+        ).pack(pady=(2, 0))
+
+        tk.Frame(self, bg=CLR_BORDER, height=1).pack(fill="x")
+
+        # ── Status bar ──────────────────────────────────────────
+        self.status_frame = tk.Frame(self, bg=CLR_BG, pady=6)
+        self.status_frame.pack(fill="x")
+
+        self.face_counter_label = tk.Label(
+            self.status_frame, text="",
+            font=("SF Pro", 11), fg=CLR_TEXT_SECONDARY, bg=CLR_BG,
+        )
+        self.face_counter_label.pack(side="left", padx=20)
+
+        self.saved_counter_label = tk.Label(
+            self.status_frame, text="",
+            font=("SF Pro", 11), fg=CLR_SUCCESS, bg=CLR_BG,
+        )
+        self.saved_counter_label.pack(side="right", padx=20)
+
+        # ── Instruction ─────────────────────────────────────────
+        self.instruction_label = tk.Label(
+            self, text="How do you feel about this face?",
+            font=("SF Pro", 13), fg=CLR_TEXT, bg=CLR_BG,
+        )
+        self.instruction_label.pack(pady=(8, 4))
+
+        # ── Canvas ──────────────────────────────────────────────
+        canvas_frame = tk.Frame(self, bg=CLR_BG, pady=8)
+        canvas_frame.pack()
+
+        self.canvas = tk.Canvas(
+            canvas_frame, width=DISPLAY_SIZE, height=DISPLAY_SIZE,
+            bg=CLR_BG,
+            highlightthickness=2, highlightbackground=CLR_PRIMARY,
+        )
+        self.canvas.pack()
+
+        self.rects = [[None] * GRID_SIZE for _ in range(GRID_SIZE)]
         for y in range(GRID_SIZE):
             for x in range(GRID_SIZE):
-                x1, y1 = x * CELL_SIZE, y * CELL_SIZE
-                x2, y2 = x1 + CELL_SIZE, y1 + CELL_SIZE
-                self.rects[y][x] = self.canvas.create_rectangle(x1, y1, x2, y2, fill="white", outline="#dddddd")
+                x1, y1 = x * PIXEL_SIZE, y * PIXEL_SIZE
+                x2, y2 = x1 + PIXEL_SIZE, y1 + PIXEL_SIZE
+                self.rects[y][x] = self.canvas.create_rectangle(
+                    x1, y1, x2, y2, fill=CLR_BG, outline="",
+                )
 
-        # --- CONTROLS ---
-        self.current_weight = 1.0
-        self.can_draw = False
+        # Drawing binds
+        self.canvas.bind("<Button-1>", lambda e: self._paint(e, 1))
+        self.canvas.bind("<B1-Motion>", lambda e: self._paint(e, 1))
+        self.canvas.bind("<Button-3>", lambda e: self._paint(e, 0))
+        self.canvas.bind("<B3-Motion>", lambda e: self._paint(e, 0))
+        self.canvas.bind("<Button-2>", lambda e: self._paint(e, 0))
+        self.canvas.bind("<B2-Motion>", lambda e: self._paint(e, 0))
 
-        # Frame 1: Rating Buttons (Visible initially)
-        self.rating_frame = tk.Frame(self)
-        self.rating_frame.pack(pady=10)
-        
-        tk.Button(self.rating_frame, text="Perfect\n(None)", bg="#a8e6cf", width=10, command=lambda: self.set_rating(0.5, "perfect")).grid(row=0, column=0, padx=5)
-        tk.Button(self.rating_frame, text="A Little\nBad", bg="#ffd3b6", width=10, command=lambda: self.set_rating(1.0, "little")).grid(row=0, column=1, padx=5)
-        tk.Button(self.rating_frame, text="A Lot\nBad", bg="#ffaaa5", width=10, command=lambda: self.set_rating(2.5, "lot")).grid(row=0, column=2, padx=5)
-        tk.Button(self.rating_frame, text="Horrible!", bg="#ff8b94", font=("Helvetica", 10, "bold"), width=10, command=lambda: self.set_rating(4.0, "horrible")).grid(row=0, column=3, padx=5)
+        # ── Rating buttons (Step 1) ─────────────────────────────
+        self.rating_frame = tk.Frame(self, bg=CLR_BG, pady=8)
+        self.rating_frame.pack()
 
-        # Frame 2: Editing Buttons (Hidden initially)
-        self.edit_frame = tk.Frame(self)
-        ttk.Button(self.edit_frame, text="Submit Correction & Train", command=self.submit_correction).grid(row=0, column=0, padx=5)
-        ttk.Button(self.edit_frame, text="Cancel (Skip)", command=self.generate_base_face).grid(row=0, column=1, padx=5)
+        tk.Button(
+            self.rating_frame, text="❤️ Love It", font=("SF Pro", 12, "bold"),
+            fg=CLR_BG, bg=CLR_SUCCESS, activebackground="#059669",
+            activeforeground=CLR_BG,
+            relief="solid", bd=1, padx=16, pady=10, cursor="hand2",
+            highlightbackground=CLR_SUCCESS,
+            command=lambda: self._rate("love"),
+        ).pack(side="left", padx=6)
 
-        ttk.Button(self, text="Main Menu", command=controller.show_menu).pack(pady=20)
+        tk.Button(
+            self.rating_frame, text="😐 Okay", font=("SF Pro", 12, "bold"),
+            fg=CLR_BG, bg=CLR_PRIMARY, activebackground="#2563EB",
+            activeforeground=CLR_BG,
+            relief="solid", bd=1, padx=16, pady=10, cursor="hand2",
+            highlightbackground=CLR_PRIMARY,
+            command=lambda: self._rate("okay"),
+        ).pack(side="left", padx=6)
 
-        # Binds
-        self.canvas.bind("<B1-Motion>", lambda e: self.paint(e, 1))
-        self.canvas.bind("<Button-1>", lambda e: self.paint(e, 1))
-        self.canvas.bind("<B3-Motion>", lambda e: self.paint(e, 0))
-        self.canvas.bind("<Button-3>", lambda e: self.paint(e, 0))
+        # Per-stage fix buttons — built dynamically
+        self.fix_buttons_frame = tk.Frame(self.rating_frame, bg=CLR_BG)
+        self.fix_buttons_frame.pack(side="left", padx=6)
+
+        tk.Button(
+            self.rating_frame, text="🚫 Skip", font=("SF Pro", 12),
+            fg=CLR_TEXT, bg=CLR_BG_HOVER,
+            relief="solid", bd=1, padx=14, pady=8, cursor="hand2",
+            highlightbackground=CLR_BORDER,
+            command=lambda: self._rate("skip"),
+        ).pack(side="left", padx=6)
+
+        # ── Edit controls (Step 2 — hidden initially) ───────────
+        self.edit_frame = tk.Frame(self, bg=CLR_BG, pady=8)
+
+        edit_buttons = tk.Frame(self.edit_frame, bg=CLR_BG)
+        edit_buttons.pack()
+
+        tk.Button(
+            edit_buttons, text="Clear Layer", font=("SF Pro", 10),
+            fg=CLR_TEXT, bg=CLR_BG, relief="solid", bd=1,
+            padx=8, pady=4,
+            command=self._clear_edit_layer,
+        ).pack(side="left", padx=4)
+
+        tk.Button(
+            edit_buttons, text="✓ Save & Refine", font=("SF Pro", 12, "bold"),
+            fg=CLR_BG, bg=CLR_SUCCESS, activebackground="#059669",
+            activeforeground=CLR_BG,
+            relief="solid", bd=1, padx=16, pady=8, cursor="hand2",
+            highlightbackground=CLR_SUCCESS,
+            command=self._submit_correction,
+        ).pack(side="left", padx=4)
+
+        tk.Button(
+            edit_buttons, text="← Cancel", font=("SF Pro", 11),
+            fg=CLR_TEXT, bg=CLR_BG, relief="solid", bd=1,
+            padx=12, pady=6,
+            command=self._cancel_edit,
+        ).pack(side="left", padx=4)
+
+        self.train_status_label = tk.Label(
+            self.edit_frame, text="",
+            font=("SF Pro", 11, "bold"), fg=CLR_PRIMARY, bg=CLR_BG,
+        )
+        self.train_status_label.pack(pady=4)
+
+        # ── Notification ────────────────────────────────────────
+        self.notif_label = tk.Label(
+            self, text="", font=("SF Pro", 12, "bold"),
+            fg=CLR_SUCCESS, bg=CLR_BG,
+        )
+        self.notif_label.pack(pady=4)
+
+        # ── Bottom nav ──────────────────────────────────────────
+        tk.Button(
+            self, text="← Main Menu", font=("SF Pro", 11),
+            fg=CLR_TEXT, bg=CLR_BG, relief="solid", bd=1,
+            padx=12, pady=6, cursor="hand2",
+            highlightbackground=CLR_BORDER,
+            command=self.controller.show_menu,
+        ).pack(pady=12)
+
+        # Keyboard shortcuts
+        self.bind_all("<Key-1>", lambda e: self._rate("love"))
+        self.bind_all("<Key-2>", lambda e: self._rate("okay"))
+        self.bind_all("<Key-3>", lambda e: self._rate("fix", 1))
+        self.bind_all("<Key-4>", lambda e: self._rate("fix", 2))
+        self.bind_all("<Key-5>", lambda e: self._rate("fix", 3))
+
+    # ── Model loading ───────────────────────────────────────────
 
     def load_model(self):
-        self.model.load_state_dict(torch.load(MODEL_FILE, weights_only=True))
-        self.model.eval()
-        self.generate_base_face()
+        """Load all available stage models."""
+        self.models = {}
+        for stage in range(1, 5):
+            _, _, model_path = STAGE_FILES[stage]
+            if os.path.exists(model_path):
+                try:
+                    if stage == 1:
+                        model = HeadVAE()
+                    else:
+                        model = ConditionalVAE(stage_name=f"stage{stage}")
+                    model.load_state_dict(torch.load(model_path, weights_only=True))
+                    model.eval()
+                    self.models[stage] = model
+                except Exception:
+                    pass
 
-    def generate_base_face(self):
-        # Reset UI State
+        self._rebuild_fix_buttons()
+        self.face_count = 0
+        self.saved_count = 0
+        self._generate_new_face()
+
+    def _rebuild_fix_buttons(self):
+        """Build fix buttons for each trained stage."""
+        for child in self.fix_buttons_frame.winfo_children():
+            child.destroy()
+
+        for stage in sorted(self.models.keys()):
+            name = STAGE_NAMES.get(stage, f"Stage {stage}")
+            tk.Button(
+                self.fix_buttons_frame,
+                text=f"🔧 Fix {name}",
+                font=("SF Pro", 11),
+                fg=CLR_BG, bg=CLR_WARNING,
+                activebackground="#D97706",
+                relief="flat", padx=12, pady=8,
+                command=lambda s=stage: self._rate("fix", s),
+            ).pack(side="left", padx=3)
+
+    # ── Face generation ─────────────────────────────────────────
+
+    def _generate_new_face(self):
+        """Generate a complete face through all trained stages."""
         self.can_draw = False
-        self.instruction_label.config(text="Step 1: Rate this generation", fg="black")
-        self.edit_frame.pack_forget()
-        self.rating_frame.pack(pady=10)
+        self.current_stage_fixing = None
+        self.face_count += 1
 
-        # Generate Image
-        z = torch.randn(1, LATENT_DIM)
-        with torch.no_grad():
-            img = self.model.decode(z).view(GRID_SIZE, GRID_SIZE).numpy()
-            
+        # Show rating UI
+        self.edit_frame.pack_forget()
+        self.rating_frame.pack(pady=8)
+        self.instruction_label.config(text="How do you feel about this face?")
+        self._update_counters()
+
+        self.current_face_imgs = {}
+        current_img = None
+
+        for stage in sorted(self.models.keys()):
+            z_dim = STAGE_Z_DIMS[stage]
+            z = torch.randn(1, z_dim)
+
+            model = self.models[stage]
+            with torch.no_grad():
+                if stage == 1:
+                    current_img = model.decode(z)
+                else:
+                    if current_img is None:
+                        break
+                    condition = (current_img > 0.5).float()
+                    current_img = model.decode(z, condition)
+
+            self.current_face_imgs[stage] = current_img.clone()
+
+        if current_img is not None:
+            img_np = current_img.view(GRID_SIZE, GRID_SIZE).numpy()
+            self._render_face(img_np)
+
+    def _render_face(self, img_array):
+        """Render a 16×16 array to the canvas."""
         for y in range(GRID_SIZE):
             for x in range(GRID_SIZE):
-                val = 1 if img[y][x] > 0.5 else 0
-                self.grid_data[y][x] = val
-                color = "#1a1a1a" if val == 1 else "white"
+                color = CLR_DRAW_PIXEL if img_array[y][x] > 0.5 else CLR_BG
                 self.canvas.itemconfig(self.rects[y][x], fill=color)
 
-    def set_rating(self, weight, severity):
-        self.current_weight = weight
-        
-        if severity == "perfect":
-            # If it's perfect, no need to edit. Train immediately.
-            self.submit_correction()
+    def _update_counters(self):
+        self.face_counter_label.config(text=f"Face #{self.face_count}")
+        if self.saved_count > 0:
+            self.saved_counter_label.config(
+                text=f"✓ {self.saved_count} saved to training data"
+            )
+
+    # ── Rating ──────────────────────────────────────────────────
+
+    def _rate(self, action, fix_stage=None):
+        if action == "love":
+            self.saved_count += 1
+            self._save_all_layers()
+            self._show_notification("❤️ Saved!", CLR_SUCCESS)
+            self.after(500, self._generate_new_face)
+
+        elif action == "okay":
+            self._generate_new_face()
+
+        elif action == "skip":
+            self._generate_new_face()
+
+        elif action == "fix" and fix_stage is not None:
+            if fix_stage in self.models:
+                self._enter_edit_mode(fix_stage)
+
+    def _save_all_layers(self):
+        """Save the current face's layers to training data for all stages."""
+        for stage in sorted(self.current_face_imgs.keys()):
+            base_path, target_path, _ = STAGE_FILES[stage]
+            target_data = (self.current_face_imgs[stage] > 0.5).float()
+            target_flat = target_data.view(-1).tolist()
+            target_int = [int(v) for v in target_flat]
+
+            try:
+                if stage == 1:
+                    with open(target_path, "a", newline="") as f:
+                        csv.writer(f).writerow(target_int)
+                else:
+                    # Get base from previous stage
+                    prev_stage = stage - 1
+                    if prev_stage in self.current_face_imgs:
+                        base_data = (self.current_face_imgs[prev_stage] > 0.5).float()
+                        base_flat = [int(v) for v in base_data.view(-1).tolist()]
+                    else:
+                        base_flat = [0] * 256
+
+                    if base_path:
+                        with open(base_path, "a", newline="") as f:
+                            csv.writer(f).writerow(base_flat)
+                    with open(target_path, "a", newline="") as f:
+                        csv.writer(f).writerow(target_int)
+            except Exception:
+                pass
+
+    # ── Edit mode ───────────────────────────────────────────────
+
+    def _enter_edit_mode(self, stage):
+        """Switch to editing mode for a specific stage."""
+        self.current_stage_fixing = stage
+        self.can_draw = True
+
+        name = STAGE_NAMES.get(stage, f"Stage {stage}")
+        self.instruction_label.config(
+            text=f"Draw corrections for {name}. Base layer is locked (blue)."
+        )
+
+        # Show edit controls, hide rating
+        self.rating_frame.pack_forget()
+        self.edit_frame.pack(pady=8)
+        self.train_status_label.config(text="")
+
+        # Set up base layer = output of stage before the one we're fixing
+        prev_stage = stage - 1
+        if prev_stage >= 1 and prev_stage in self.current_face_imgs:
+            base_img = (self.current_face_imgs[prev_stage] > 0.5).float()
         else:
-            # Unlock the canvas for drawing
-            self.can_draw = True
-            self.rating_frame.pack_forget()
-            self.edit_frame.pack(pady=10)
-            self.instruction_label.config(text="Step 2: Fix the mistakes on the canvas, then submit.", fg="#d90429")
+            base_img = torch.zeros(1, 256)
 
-    def paint(self, event, val):
-        if not self.can_draw: return
-        x, y = event.x // CELL_SIZE, event.y // CELL_SIZE
-        if 0 <= x < GRID_SIZE and 0 <= y < GRID_SIZE:
-            self.grid_data[y][x] = val
-            color = "#1a1a1a" if val == 1 else "white"
-            self.canvas.itemconfig(self.rects[y][x], fill=color)
+        base_np = base_img.view(GRID_SIZE, GRID_SIZE).numpy()
+        self.base_data = [[int(base_np[y][x] > 0.5) for x in range(GRID_SIZE)]
+                          for y in range(GRID_SIZE)]
+        self.grid_data = [[0] * GRID_SIZE for _ in range(GRID_SIZE)]
 
-    def submit_correction(self):
-        flat_data =[pixel for row in self.grid_data for pixel in row]
-        
-        # 1. Save the corrected image to your permanent dataset
-        with open(DATA_FILE, "a", newline="") as f:
-            csv.writer(f).writerow(flat_data)
+        # Render base in blue, clear edit layer
+        for y in range(GRID_SIZE):
+            for x in range(GRID_SIZE):
+                color = CLR_BASE_PIXEL if self.base_data[y][x] == 1 else CLR_BG
+                self.canvas.itemconfig(self.rects[y][x], fill=color)
 
-        # 2. INSTANT WEIGHTED TRAINING STEP
-        self.model.train()
-        optimizer = optim.Adam(self.model.parameters(), lr=2e-4)
-        tensor_img = torch.tensor(flat_data, dtype=torch.float32)
-        
-        optimizer.zero_grad()
-        recon, mu, logvar = self.model(tensor_img)
-        loss = loss_function(recon, tensor_img, mu, logvar)
-        
-        # Multiply the loss by the severity weight!
-        weighted_loss = loss * self.current_weight
-        weighted_loss.backward()
-        
-        optimizer.step()
-        torch.save(self.model.state_dict(), MODEL_FILE)
-        self.model.eval()
+    def _paint(self, event, val):
+        """Paint on the canvas (only in edit mode)."""
+        if not self.can_draw:
+            return
+        x, y = event.x // PIXEL_SIZE, event.y // PIXEL_SIZE
+        if not (0 <= x < GRID_SIZE and 0 <= y < GRID_SIZE):
+            return
+        # Don't modify base layer pixels
+        if self.base_data[y][x] == 1:
+            return
 
-        # Generate the next face to keep the loop going
-        self.generate_base_face()
+        self.grid_data[y][x] = val
+        if val == 1:
+            color = CLR_DRAW_PIXEL
+        else:
+            color = CLR_BG
+        self.canvas.itemconfig(self.rects[y][x], fill=color)
+
+    def _clear_edit_layer(self):
+        """Clear just the edit layer (keep base)."""
+        self.grid_data = [[0] * GRID_SIZE for _ in range(GRID_SIZE)]
+        for y in range(GRID_SIZE):
+            for x in range(GRID_SIZE):
+                if self.base_data[y][x] != 1:
+                    self.canvas.itemconfig(self.rects[y][x], fill=CLR_BG)
+
+    def _cancel_edit(self):
+        """Cancel editing and return to rating view."""
+        self.can_draw = False
+        self.current_stage_fixing = None
+
+        # Re-render the original face
+        max_stage = max(self.current_face_imgs.keys())
+        if max_stage in self.current_face_imgs:
+            img_np = self.current_face_imgs[max_stage].view(GRID_SIZE, GRID_SIZE).numpy()
+            self._render_face(img_np)
+
+        self.edit_frame.pack_forget()
+        self.rating_frame.pack(pady=8)
+        self.instruction_label.config(text="How do you feel about this face?")
+
+    def _submit_correction(self):
+        """Save correction and run mini-retrain."""
+        stage = self.current_stage_fixing
+        if stage is None:
+            return
+
+        # Build target = base + current drawing
+        target_flat = []
+        base_flat = []
+        for y in range(GRID_SIZE):
+            for x in range(GRID_SIZE):
+                target_val = 1 if (self.base_data[y][x] == 1 or self.grid_data[y][x] == 1) else 0
+                target_flat.append(target_val)
+                base_flat.append(self.base_data[y][x])
+
+        drawn = sum(self.grid_data[y][x] for y in range(GRID_SIZE) for x in range(GRID_SIZE))
+        if drawn == 0:
+            self._show_notification("⚠ Draw something first!", CLR_DANGER)
+            return
+
+        # Save to training data
+        base_path, target_path, model_path = STAGE_FILES[stage]
+        try:
+            if stage == 1:
+                with open(target_path, "a", newline="") as f:
+                    csv.writer(f).writerow(target_flat)
+            else:
+                if base_path:
+                    with open(base_path, "a", newline="") as f:
+                        csv.writer(f).writerow(base_flat)
+                with open(target_path, "a", newline="") as f:
+                    csv.writer(f).writerow(target_flat)
+        except Exception as e:
+            self._show_notification(f"⚠ Save failed: {e}", CLR_DANGER)
+            return
+
+        self.saved_count += 1
+        self._update_counters()
+
+        # Mini-retrain in background
+        self.can_draw = False
+        self.train_status_label.config(text=f"Training... 0/{REFINE_STEPS} steps")
+
+        def do_retrain():
+            try:
+                model = self.models[stage]
+                model.train()
+                optimizer = optim.Adam(model.parameters(), lr=TRAINING_LR * 0.5)
+
+                target_tensor = torch.tensor([target_flat], dtype=torch.float32)
+                base_tensor = torch.tensor([base_flat], dtype=torch.float32)
+
+                for step in range(1, REFINE_STEPS + 1):
+                    optimizer.zero_grad()
+                    if stage == 1:
+                        recon, mu, logvar = model(target_tensor)
+                    else:
+                        recon, mu, logvar = model(target_tensor, base_tensor)
+
+                    loss = staged_loss(recon, target_tensor, base_tensor, mu, logvar, beta=0.5)
+                    loss.backward()
+                    optimizer.step()
+
+                    if step % 3 == 0:
+                        try:
+                            self.after(0, lambda s=step: self.train_status_label.config(
+                                text=f"Training... {s}/{REFINE_STEPS} steps"
+                            ))
+                        except Exception:
+                            break
+
+                model.eval()
+                torch.save(model.state_dict(), model_path)
+
+                # Regenerate from the fixed stage onward
+                self.after(0, self._regenerate_from_stage, stage)
+
+            except Exception as e:
+                try:
+                    self.after(0, lambda: self._show_notification(f"⚠ Training failed: {e}", CLR_DANGER))
+                except Exception:
+                    pass
+
+        thread = threading.Thread(target=do_retrain, daemon=True)
+        thread.start()
+
+    def _regenerate_from_stage(self, from_stage):
+        """Regenerate the face from a specific stage onward."""
+        current_img = None
+
+        # Use existing images up to from_stage - 1
+        for stage in sorted(self.current_face_imgs.keys()):
+            if stage < from_stage:
+                current_img = self.current_face_imgs[stage]
+            else:
+                break
+
+        # Regenerate from from_stage onward
+        for stage in sorted(self.models.keys()):
+            if stage < from_stage:
+                continue
+
+            z_dim = STAGE_Z_DIMS[stage]
+            z = torch.randn(1, z_dim)
+            model = self.models[stage]
+
+            with torch.no_grad():
+                if stage == 1:
+                    current_img = model.decode(z)
+                else:
+                    if current_img is None:
+                        break
+                    condition = (current_img > 0.5).float()
+                    current_img = model.decode(z, condition)
+
+            self.current_face_imgs[stage] = current_img.clone()
+
+        if current_img is not None:
+            img_np = current_img.view(GRID_SIZE, GRID_SIZE).numpy()
+            self._render_face(img_np)
+
+        # Return to rating view
+        self.can_draw = False
+        self.current_stage_fixing = None
+        self.edit_frame.pack_forget()
+        self.rating_frame.pack(pady=8)
+        self.instruction_label.config(text="How do you feel about this face?")
+        self.train_status_label.config(text="")
+        self._show_notification("✓ Refined!", CLR_SUCCESS)
+
+    # ── Helpers ─────────────────────────────────────────────────
+
+    def _show_notification(self, text, color):
+        self.notif_label.config(text=text, fg=color)
+        self.after(2000, lambda: self.notif_label.config(text=""))
