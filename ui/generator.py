@@ -8,8 +8,9 @@ from config import (
     GRID_SIZE, CELL_SIZE, RENDER_THRESHOLD,
     STAGE1_Z, STAGE2_Z, STAGE3_Z, STAGE4_Z,
     STAGE_NAMES, STAGE_ICONS, STAGE_FILES,
+    REJECTION_SAMPLE_COUNT,
 )
-from model import HeadVAE, ConditionalVAE
+from model import HeadVAE, ConditionalVAE, score_structural_quality
 
 # Design system colors
 CLR_PRIMARY = "#3B82F6"
@@ -241,20 +242,47 @@ class GeneratorUI(tk.Frame):
     def _randomize_stage(self, stage):
         """Randomize sliders for a single stage and regenerate."""
         if stage in self.slider_widgets:
+            if stage == 1 and stage in self.models:
+                self._randomize_with_rejection(stage)
+            else:
+                for slider, label in self.slider_widgets[stage]:
+                    val = random.uniform(-2.0, 2.0)
+                    slider.set(val)
+                    label.config(text=f"{val:.2f}")
+        self._generate_face()
+
+    def _randomize_all(self):
+        """Randomize all stage sliders and regenerate."""
+        # Rejection-sample stage 1 first
+        if 1 in self.slider_widgets and 1 in self.models:
+            self._randomize_with_rejection(1)
+        # Randomize stages 2+ normally
+        for stage in self.slider_widgets:
+            if stage == 1:
+                continue
             for slider, label in self.slider_widgets[stage]:
                 val = random.uniform(-2.0, 2.0)
                 slider.set(val)
                 label.config(text=f"{val:.2f}")
         self._generate_face()
 
-    def _randomize_all(self):
-        """Randomize all stage sliders and regenerate."""
-        for stage in self.slider_widgets:
-            for slider, label in self.slider_widgets[stage]:
-                val = random.uniform(-2.0, 2.0)
-                slider.set(val)
-                label.config(text=f"{val:.2f}")
-        self._generate_face()
+    def _randomize_with_rejection(self, stage):
+        """Generate N candidate z vectors and pick the structurally best one."""
+        model = self.models[stage]
+        z_dim = STAGE_Z_DIMS[stage]
+        n = REJECTION_SAMPLE_COUNT
+
+        with torch.no_grad():
+            candidates = torch.randn(n, z_dim) * 1.5
+            outputs = model.decode(candidates)
+            scores = score_structural_quality(outputs)
+            best_idx = scores.argmin().item()
+            best_z = candidates[best_idx]
+
+        for i, (slider, label) in enumerate(self.slider_widgets[stage]):
+            val = best_z[i].item()
+            slider.set(val)
+            label.config(text=f"{val:.2f}")
 
     # ── Generation pipeline ─────────────────────────────────────
 

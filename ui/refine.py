@@ -11,9 +11,9 @@ from config import (
     GRID_SIZE, CELL_SIZE, RENDER_THRESHOLD,
     STAGE_NAMES, STAGE_ICONS, STAGE_FILES, STAGE_MIN_SAMPLES,
     STAGE1_Z, STAGE2_Z, STAGE3_Z, STAGE4_Z,
-    TRAINING_LR,
+    TRAINING_LR, REJECTION_SAMPLE_COUNT, CONNECTIVITY_WEIGHT,
 )
-from model import HeadVAE, ConditionalVAE, staged_loss
+from model import HeadVAE, ConditionalVAE, staged_loss, score_structural_quality
 
 # Design system colors
 CLR_PRIMARY = "#3B82F6"
@@ -276,13 +276,18 @@ class RefineUI(tk.Frame):
 
         for stage in sorted(self.models.keys()):
             z_dim = STAGE_Z_DIMS[stage]
-            z = torch.randn(1, z_dim)
-
             model = self.models[stage]
+
             with torch.no_grad():
                 if stage == 1:
-                    current_img = model.decode(z)
+                    # Rejection sampling: pick best of N candidates
+                    candidates = torch.randn(REJECTION_SAMPLE_COUNT, z_dim) * 1.5
+                    outputs = model.decode(candidates)
+                    scores = score_structural_quality(outputs)
+                    best_idx = scores.argmin().item()
+                    current_img = outputs[best_idx:best_idx + 1]
                 else:
+                    z = torch.randn(1, z_dim)
                     if current_img is None:
                         break
                     condition = (current_img > RENDER_THRESHOLD).float()
@@ -535,7 +540,9 @@ class RefineUI(tk.Frame):
                     else:
                         recon, mu, logvar = model(target_tensor, base_tensor)
 
-                    loss = staged_loss(recon, target_tensor, base_tensor, mu, logvar, beta=0.3)
+                    conn_w = CONNECTIVITY_WEIGHT * 0.5 if stage == 1 else 0.0
+                    loss = staged_loss(recon, target_tensor, base_tensor, mu, logvar,
+                                       beta=0.3, connectivity_weight=conn_w)
                     loss.backward()
                     optimizer.step()
 
@@ -579,13 +586,17 @@ class RefineUI(tk.Frame):
                 continue
 
             z_dim = STAGE_Z_DIMS[stage]
-            z = torch.randn(1, z_dim)
             model = self.models[stage]
 
             with torch.no_grad():
                 if stage == 1:
-                    current_img = model.decode(z)
+                    candidates = torch.randn(REJECTION_SAMPLE_COUNT, z_dim) * 1.5
+                    outputs = model.decode(candidates)
+                    scores = score_structural_quality(outputs)
+                    best_idx = scores.argmin().item()
+                    current_img = outputs[best_idx:best_idx + 1]
                 else:
+                    z = torch.randn(1, z_dim)
                     if current_img is None:
                         break
                     condition = (current_img > RENDER_THRESHOLD).float()

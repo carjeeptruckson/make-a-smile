@@ -1,6 +1,14 @@
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from config import STAGE1_Z, STAGE2_Z, STAGE3_Z, STAGE4_Z
+
+# Fixed 3x3 kernel for counting filled neighbors (center=0, surround=1/8)
+_NEIGHBOR_KERNEL = torch.tensor(
+    [[1, 1, 1],
+     [1, 0, 1],
+     [1, 1, 1]], dtype=torch.float32
+).reshape(1, 1, 3, 3) / 8.0
 
 
 class HeadVAE(nn.Module):
@@ -120,8 +128,49 @@ def sharpening_loss(output):
     return entropy.mean()
 
 
+def neighbor_consistency_loss(output, stray_thresh=0.2, gap_thresh=0.6):
+    """Differentiable loss penalizing stray pixels and gaps in the output.
+
+    Uses conv2d with a fixed neighbor-counting kernel. Stray pixels are filled
+    pixels with very few filled neighbors; gaps are empty pixels surrounded by
+    filled ones.
+    """
+    out_2d = output.view(-1, 1, 16, 16)
+    kernel = _NEIGHBOR_KERNEL.to(output.device)
+    neighbor_density = F.conv2d(out_2d, kernel, padding=1)
+
+    # Stray: filled pixel with low neighbor density
+    stray = (out_2d * F.relu(stray_thresh - neighbor_density)).mean()
+    # Gap: empty pixel with high neighbor density
+    gap = ((1.0 - out_2d) * F.relu(neighbor_density - gap_thresh)).mean()
+    return stray + gap
+
+
+def score_structural_quality(img_tensor):
+    """Score a batch of 16x16 images for structural quality (lower = better).
+
+    Used for rejection sampling during generation.
+    """
+    with torch.no_grad():
+        binary = (img_tensor > 0.5).float().view(-1, 1, 16, 16)
+        kernel = _NEIGHBOR_KERNEL.to(img_tensor.device)
+        neighbors = F.conv2d(binary, kernel, padding=1)
+
+        # Count stray pixels (filled with <2 of 8 neighbors → density < 0.25)
+        stray = (binary * (neighbors < 0.25).float()).sum(dim=(1, 2, 3))
+        # Count gap pixels (empty with 5+ of 8 neighbors → density > 0.6)
+        gap = ((1.0 - binary) * (neighbors > 0.6).float()).sum(dim=(1, 2, 3))
+
+        # Pixel count penalty — heads should have ~20-150 filled pixels
+        pixel_count = binary.sum(dim=(1, 2, 3))
+        count_penalty = F.relu(20.0 - pixel_count) + F.relu(pixel_count - 150.0)
+
+        return stray + gap + count_penalty * 0.5
+
+
 def staged_loss(recon, target, base_image, mu, logvar, beta,
-                new_pixel_weight=2.0, sharpness_weight=0.15):
+                new_pixel_weight=2.0, sharpness_weight=0.15,
+                connectivity_weight=0.0):
     """Loss function for staged training with pixel weighting.
 
     New pixels (present in target but not in base) are weighted higher so the
@@ -161,7 +210,12 @@ def staged_loss(recon, target, base_image, mu, logvar, beta,
     # Sharpening: penalize outputs near 0.5 to encourage binary-like values
     sharp = sharpening_loss(recon_flat)
 
-    return weighted_bce + beta * kld + sharpness_weight * sharp
+    total = weighted_bce + beta * kld + sharpness_weight * sharp
+
+    if connectivity_weight > 0:
+        total = total + connectivity_weight * neighbor_consistency_loss(recon_flat)
+
+    return total
 
 
 def kl_beta_schedule(epoch, warmup_start=100, warmup_end=400, final_beta=0.8):

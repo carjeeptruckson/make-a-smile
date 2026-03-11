@@ -12,6 +12,7 @@ from config import (
     STAGE1_Z, STAGE2_Z, STAGE3_Z, STAGE4_Z,
     KL_WARMUP_START, KL_WARMUP_END, KL_FINAL_BETA,
     TRAINING_EPOCHS, TRAINING_LR, NOISE_FACTOR, SHARPNESS_WEIGHT,
+    CONNECTIVITY_WEIGHT, CONNECTIVITY_WARMUP_START, CONNECTIVITY_WARMUP_END,
 )
 from model import HeadVAE, ConditionalVAE, staged_loss, kl_beta_schedule, add_noise
 
@@ -393,6 +394,54 @@ class MainMenu(tk.Frame):
             return
         self.controller.show_refine()
 
+    # ── Data curation ────────────────────────────────────────────
+
+    @staticmethod
+    def _curate_training_data(targets, bases, stage):
+        """Filter out bad training samples before training.
+
+        Returns (filtered_targets, filtered_bases, n_removed).
+        """
+        if stage == 1:
+            keep = []
+            for i, row in enumerate(targets):
+                arr = np.array(row).reshape(GRID_SIZE, GRID_SIZE)
+                filled = (arr > 0.5).sum()
+                # Reject nearly empty or nearly solid
+                if filled < 15 or filled > 180:
+                    continue
+                # Check for stray pixels: count neighbors for each filled pixel
+                padded = np.pad(arr > 0.5, 1, mode='constant').astype(float)
+                neighbor_count = sum(
+                    np.roll(np.roll(padded, dy, 0), dx, 1)
+                    for dy in (-1, 0, 1) for dx in (-1, 0, 1)
+                    if (dy, dx) != (0, 0)
+                )[1:-1, 1:-1]
+                filled_mask = arr > 0.5
+                if filled_mask.sum() > 0:
+                    stray_frac = ((neighbor_count < 2) & filled_mask).sum() / filled_mask.sum()
+                    if stray_frac > 0.3:
+                        continue
+                keep.append(i)
+        else:
+            # Stages 2-4: reject if nothing new was drawn
+            keep = []
+            for i, row in enumerate(targets):
+                if bases and i < len(bases):
+                    new_pixels = sum(1 for t, b in zip(row, bases[i]) if t > 0.5 and b < 0.5)
+                    if new_pixels < 3:
+                        continue
+                keep.append(i)
+
+        # Don't curate if we'd lose too much data
+        if len(keep) < len(targets) * 0.7:
+            return targets, bases, 0
+
+        n_removed = len(targets) - len(keep)
+        filtered_targets = [targets[i] for i in keep]
+        filtered_bases = [bases[i] for i in keep] if bases else []
+        return filtered_targets, filtered_bases, n_removed
+
     # ── Training ────────────────────────────────────────────────
 
     def _train_stage(self, stage):
@@ -496,6 +545,19 @@ class MainMenu(tk.Frame):
                             if len(row) == 256:
                                 bases.append([float(v) for v in row])
 
+                # Curate: remove bad samples
+                targets, bases, n_removed = self._curate_training_data(
+                    targets, bases, stage,
+                )
+                if n_removed > 0:
+                    try:
+                        modal.after(0, lambda n=n_removed: status_label.config(
+                            text=f"Cleaned: removed {n} bad sample(s)",
+                            fg=CLR_WARNING,
+                        ))
+                    except Exception:
+                        pass
+
                 # Augmentation: horizontal flip (doubles data)
                 aug_targets = []
                 aug_bases = []
@@ -575,10 +637,18 @@ class MainMenu(tk.Frame):
                             epoch, KL_WARMUP_START, KL_WARMUP_END, KL_FINAL_BETA,
                         )
                         npw = 1.0 if stage == 1 else 2.0
+                        # Connectivity loss ramps up for stage 1
+                        if stage == 1 and epoch > CONNECTIVITY_WARMUP_START:
+                            conn_progress = min(1.0, (epoch - CONNECTIVITY_WARMUP_START)
+                                                / (CONNECTIVITY_WARMUP_END - CONNECTIVITY_WARMUP_START))
+                            conn_w = CONNECTIVITY_WEIGHT * conn_progress
+                        else:
+                            conn_w = 0.0
                         loss = staged_loss(
                             recon, batch_target, batch_base, mu, logvar, beta,
                             new_pixel_weight=npw,
                             sharpness_weight=SHARPNESS_WEIGHT,
+                            connectivity_weight=conn_w,
                         )
 
                         loss.backward()

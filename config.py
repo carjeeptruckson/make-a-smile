@@ -9,7 +9,7 @@ GRID_SIZE = 16
 CELL_SIZE = 24
 
 # Per-stage latent dimensions
-STAGE1_Z = 4
+STAGE1_Z = 6
 STAGE2_Z = 3
 STAGE3_Z = 3
 STAGE4_Z = 3
@@ -48,6 +48,14 @@ TRAINING_EPOCHS = 800
 TRAINING_LR = 5e-4
 NOISE_FACTOR = 0.03
 SHARPNESS_WEIGHT = 0.15
+
+# Connectivity loss (stage 1 only) — penalizes stray pixels and gaps
+CONNECTIVITY_WEIGHT = 0.3
+CONNECTIVITY_WARMUP_START = 100
+CONNECTIVITY_WARMUP_END = 300
+
+# Rejection sampling — number of candidates to generate and pick the best
+REJECTION_SAMPLE_COUNT = 8
 
 # Rendering: threshold for binarizing sigmoid outputs
 # With sharpening loss, the model produces crisp 0-or-1 outputs,
