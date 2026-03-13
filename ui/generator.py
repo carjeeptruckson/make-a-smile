@@ -59,6 +59,13 @@ class GeneratorUI(tk.Frame):
         header = tk.Frame(self, bg=CLR_BG_LIGHT, pady=16)
         header.pack(fill="x")
 
+        tk.Button(
+            header, text="← Menu", font=("SF Pro", 11),
+            fg=CLR_TEXT, bg=CLR_BG_LIGHT, relief="flat",
+            padx=12, pady=4, cursor="hand2",
+            command=self.controller.show_menu,
+        ).pack(side="left", padx=12)
+
         tk.Label(
             header, text="Face Generator",
             font=("SF Pro", 24, "bold"), fg=CLR_TEXT, bg=CLR_BG_LIGHT,
@@ -266,16 +273,18 @@ class GeneratorUI(tk.Frame):
         self._debounce_id = self.after(100, self._generate_face)
 
     def _randomize_stage(self, stage):
-        """Randomize sliders for a single stage and regenerate."""
-        if stage in self.slider_widgets:
-            if stage == 1 and stage in self.models:
-                self._randomize_with_rejection(stage)
-            else:
-                for slider, label in self.slider_widgets[stage]:
-                    val = random.uniform(-2.0, 2.0)
-                    slider.set(val)
-                    label.config(text=f"{val:.2f}")
-        self._generate_face()
+        """Randomize sliders for one stage and regenerate from that stage only."""
+        if stage not in self.slider_widgets:
+            return
+        if stage == 1 and stage in self.models:
+            self._randomize_with_rejection(stage)
+        else:
+            for slider, label in self.slider_widgets[stage]:
+                val = random.uniform(-2.0, 2.0)
+                slider.set(val)
+                label.config(text=f"{val:.2f}")
+        # Regenerate from this stage only — lower layers are unchanged
+        self._generate_from(stage)
 
     def _randomize_all(self):
         """Randomize all stage sliders and regenerate."""
@@ -312,6 +321,57 @@ class GeneratorUI(tk.Frame):
 
     # ── Generation pipeline ─────────────────────────────────────
 
+    def _generate_from(self, from_stage):
+        """Regenerate from from_stage upward, reusing cached outputs below it."""
+        if self._generating or not self.models:
+            return
+        self._generating = True
+
+        def do_generate():
+            try:
+                # Seed current_img from the cached output just below from_stage
+                current_img = None
+                for s in sorted(self.models.keys()):
+                    if s < from_stage:
+                        current_img = self._current_stage_imgs.get(s, None)
+                    else:
+                        break
+
+                stage_imgs = {s: v for s, v in self._current_stage_imgs.items()
+                              if s < from_stage}
+
+                for stage in sorted(self.models.keys()):
+                    if stage < from_stage:
+                        continue
+                    z_values = [s.get() for s, _ in self.slider_widgets[stage]]
+                    z_tensor = torch.tensor([z_values], dtype=torch.float32)
+                    model = self.models[stage]
+
+                    with torch.no_grad():
+                        if stage == 1:
+                            current_img = model.decode(z_tensor)
+                        else:
+                            if current_img is None:
+                                break
+                            condition = (current_img > RENDER_THRESHOLD).float()
+                            raw = model.decode(z_tensor, condition)
+                            current_img = torch.max(raw, condition)
+
+                    stage_imgs[stage] = current_img.clone()
+
+                self._current_stage_imgs = stage_imgs
+
+                if current_img is not None:
+                    img_np = current_img.view(GRID_SIZE, GRID_SIZE).numpy()
+                    self.after(0, lambda: self._render_face(img_np))
+
+            except Exception:
+                pass
+            finally:
+                self._generating = False
+
+        threading.Thread(target=do_generate, daemon=True).start()
+
     def _generate_face(self):
         """Run the staged generation pipeline."""
         if self._generating or not self.models:
@@ -339,7 +399,9 @@ class GeneratorUI(tk.Frame):
                                 break
                             # Binarize the condition for cleaner conditioning
                             condition = (current_img > RENDER_THRESHOLD).float()
-                            current_img = model.decode(z_tensor, condition)
+                            raw = model.decode(z_tensor, condition)
+                            # Later stages can only ADD pixels, never erase the base
+                            current_img = torch.max(raw, condition)
 
                     stage_imgs[stage] = current_img.clone()
 

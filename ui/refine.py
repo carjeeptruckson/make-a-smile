@@ -50,6 +50,7 @@ class RefineUI(tk.Frame):
         self.can_draw = False
         self.face_count = 0
         self.saved_count = 0
+        self._corrected_stages = set()  # stages that have unsaved corrections
 
         self.grid_data = [[0] * GRID_SIZE for _ in range(GRID_SIZE)]
         self.base_data = [[0] * GRID_SIZE for _ in range(GRID_SIZE)]
@@ -128,35 +129,27 @@ class RefineUI(tk.Frame):
         self.rating_frame = tk.Frame(self, bg=CLR_BG, pady=8)
         self.rating_frame.pack()
 
-        tk.Button(
-            self.rating_frame, text="❤️ Love It", font=("SF Pro", 12, "bold"),
+        self.save_train_btn = tk.Button(
+            self.rating_frame, text="💾 Save & Train", font=("SF Pro", 12, "bold"),
             fg=CLR_BG, bg=CLR_SUCCESS, activebackground="#059669",
             activeforeground=CLR_BG,
             relief="solid", bd=1, padx=16, pady=10, cursor="hand2",
             highlightbackground=CLR_SUCCESS,
-            command=lambda: self._rate("love"),
-        ).pack(side="left", padx=6)
+            command=lambda: self._rate("save_train"),
+        )
+        self.save_train_btn.pack(side="left", padx=6)
 
         tk.Button(
-            self.rating_frame, text="😐 Okay", font=("SF Pro", 12, "bold"),
-            fg=CLR_BG, bg=CLR_PRIMARY, activebackground="#2563EB",
-            activeforeground=CLR_BG,
-            relief="solid", bd=1, padx=16, pady=10, cursor="hand2",
-            highlightbackground=CLR_PRIMARY,
-            command=lambda: self._rate("okay"),
-        ).pack(side="left", padx=6)
-
-        # Per-stage fix buttons — built dynamically
-        self.fix_buttons_frame = tk.Frame(self.rating_frame, bg=CLR_BG)
-        self.fix_buttons_frame.pack(side="left", padx=6)
-
-        tk.Button(
-            self.rating_frame, text="🚫 Skip", font=("SF Pro", 12),
+            self.rating_frame, text="→ Next Face", font=("SF Pro", 12),
             fg=CLR_TEXT, bg=CLR_BG_HOVER,
             relief="solid", bd=1, padx=14, pady=8, cursor="hand2",
             highlightbackground=CLR_BORDER,
             command=lambda: self._rate("skip"),
         ).pack(side="left", padx=6)
+
+        # Per-stage fix buttons — built dynamically
+        self.fix_buttons_frame = tk.Frame(self.rating_frame, bg=CLR_BG)
+        self.fix_buttons_frame.pack(side="left", padx=6)
 
         # ── Edit controls (Step 2 — hidden initially) ───────────
         self.edit_frame = tk.Frame(self, bg=CLR_BG, pady=8)
@@ -172,7 +165,7 @@ class RefineUI(tk.Frame):
         ).pack(side="left", padx=4)
 
         tk.Button(
-            edit_buttons, text="✓ Save & Refine", font=("SF Pro", 12, "bold"),
+            edit_buttons, text="✓ Apply", font=("SF Pro", 12, "bold"),
             fg=CLR_BG, bg=CLR_SUCCESS, activebackground="#059669",
             activeforeground=CLR_BG,
             relief="solid", bd=1, padx=16, pady=8, cursor="hand2",
@@ -210,8 +203,8 @@ class RefineUI(tk.Frame):
         ).pack(pady=12)
 
         # Keyboard shortcuts
-        self.bind_all("<Key-1>", lambda e: self._rate("love"))
-        self.bind_all("<Key-2>", lambda e: self._rate("okay"))
+        self.bind_all("<Key-1>", lambda e: self._rate("save_train"))
+        self.bind_all("<Key-2>", lambda e: self._rate("skip"))
         self.bind_all("<Key-3>", lambda e: self._rate("fix", 1))
         self.bind_all("<Key-4>", lambda e: self._rate("fix", 2))
         self.bind_all("<Key-5>", lambda e: self._rate("fix", 3))
@@ -263,6 +256,7 @@ class RefineUI(tk.Frame):
         """Generate a complete face through all trained stages."""
         self.can_draw = False
         self.current_stage_fixing = None
+        self._corrected_stages.clear()
         self.face_count += 1
 
         # Show rating UI
@@ -291,7 +285,9 @@ class RefineUI(tk.Frame):
                     if current_img is None:
                         break
                     condition = (current_img > RENDER_THRESHOLD).float()
-                    current_img = model.decode(z, condition)
+                    raw = model.decode(z, condition)
+                    # Later stages can only ADD pixels, never erase the base
+                    current_img = torch.max(raw, condition)
 
             self.current_face_imgs[stage] = current_img.clone()
 
@@ -316,21 +312,112 @@ class RefineUI(tk.Frame):
     # ── Rating ──────────────────────────────────────────────────
 
     def _rate(self, action, fix_stage=None):
-        if action == "love":
-            self.saved_count += 1
-            self._save_all_layers()
-            self._show_notification("❤️ Saved!", CLR_SUCCESS)
-            self.after(500, self._generate_new_face)
-
-        elif action == "okay":
-            self._generate_new_face()
+        if action == "save_train":
+            self._do_save_and_train()
 
         elif action == "skip":
+            self._corrected_stages.clear()
             self._generate_new_face()
 
         elif action == "fix" and fix_stage is not None:
             if fix_stage in self.models:
                 self._enter_edit_mode(fix_stage)
+
+    def _do_save_and_train(self):
+        """Save all current layers to training data, mini-retrain corrected
+        stages, then move to a new face."""
+        self._save_all_layers()
+        self.saved_count += 1
+        self._update_counters()
+
+        stages_to_train = list(self._corrected_stages) if self._corrected_stages else []
+        self._corrected_stages.clear()
+
+        if not stages_to_train:
+            self._show_notification("💾 Saved!", CLR_SUCCESS)
+            self.after(500, self._generate_new_face)
+            return
+
+        # Mini-retrain each corrected stage then move on
+        self.save_train_btn.config(state="disabled")
+        self.train_status_label.config(text=f"Training stage(s) {stages_to_train}...")
+
+        def do_retrain():
+            for stage in stages_to_train:
+                try:
+                    _, model_path = STAGE_FILES[stage][1], STAGE_FILES[stage][2]
+                    base_file, target_file, model_path = STAGE_FILES[stage]
+                    model = self.models[stage]
+                    model.train()
+                    optimizer = optim.Adam(model.parameters(), lr=TRAINING_LR * 0.5)
+
+                    all_targets, all_bases = [], []
+                    if os.path.exists(target_file):
+                        with open(target_file, "r") as f:
+                            for row in csv.reader(f):
+                                if len(row) == 256:
+                                    all_targets.append([float(v) for v in row])
+                    if stage > 1 and base_file and os.path.exists(base_file):
+                        with open(base_file, "r") as f:
+                            for row in csv.reader(f):
+                                if len(row) == 256:
+                                    all_bases.append([float(v) for v in row])
+
+                    if not all_targets:
+                        continue
+
+                    target_tensor = torch.tensor(all_targets, dtype=torch.float32)
+                    base_tensor = (torch.zeros_like(target_tensor) if stage == 1
+                                   else torch.tensor(all_bases, dtype=torch.float32)
+                                   if all_bases else torch.zeros_like(target_tensor))
+
+                    n = target_tensor.shape[0]
+                    batch_size = min(32, n)
+                    for step in range(1, REFINE_STEPS + 1):
+                        perm = torch.randperm(n)
+                        for start in range(0, n, batch_size):
+                            idx = perm[start:start + batch_size]
+                            bt, bb = target_tensor[idx], base_tensor[idx]
+                            optimizer.zero_grad()
+                            recon, mu, logvar = (model(bt) if stage == 1
+                                                 else model(bt, bb))
+                            conn_w = CONNECTIVITY_WEIGHT * 0.5 if stage == 1 else 0.0
+                            loss = staged_loss(recon, bt, bb, mu, logvar,
+                                               beta=0.3, connectivity_weight=conn_w)
+                            loss.backward()
+                            torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+                            optimizer.step()
+
+                        if step % 10 == 0:
+                            try:
+                                self.after(0, lambda s=step, st=stage:
+                                           self.train_status_label.config(
+                                               text=f"Training stage {st}… {s}/{REFINE_STEPS}"))
+                            except Exception:
+                                break
+
+                    model.eval()
+                    torch.save(model.state_dict(), model_path)
+
+                except Exception as e:
+                    try:
+                        self.after(0, lambda err=e: self._show_notification(
+                            f"⚠ Train error: {err}", CLR_DANGER))
+                    except Exception:
+                        pass
+
+            try:
+                self.after(0, self._after_train_done)
+            except Exception:
+                pass
+
+        threading.Thread(target=do_retrain, daemon=True).start()
+
+    def _after_train_done(self):
+        self.save_train_btn.config(state="normal")
+        self.train_status_label.config(text="")
+        self._show_notification("✓ Saved & trained!", CLR_SUCCESS)
+        self.after(600, self._generate_new_face)
 
     def _save_all_layers(self):
         """Save the current face's layers to training data for all stages."""
@@ -455,119 +542,57 @@ class RefineUI(tk.Frame):
         self.instruction_label.config(text="How do you feel about this face?")
 
     def _submit_correction(self):
-        """Save correction and run mini-retrain."""
+        """Apply the drawn correction to the current face and return to rating.
+
+        Does NOT train yet — training happens when the user clicks Save & Train.
+        """
         stage = self.current_stage_fixing
         if stage is None:
             return
-
-        # Build target = base + current drawing
-        target_flat = []
-        base_flat = []
-        for y in range(GRID_SIZE):
-            for x in range(GRID_SIZE):
-                target_val = 1 if (self.base_data[y][x] == 1 or self.grid_data[y][x] == 1) else 0
-                target_flat.append(target_val)
-                base_flat.append(self.base_data[y][x])
 
         drawn = sum(self.grid_data[y][x] for y in range(GRID_SIZE) for x in range(GRID_SIZE))
         if drawn == 0:
             self._show_notification("⚠ Draw something first!", CLR_DANGER)
             return
 
-        # Save to training data
-        base_path, target_path, model_path = STAGE_FILES[stage]
-        try:
-            if stage == 1:
-                with open(target_path, "a", newline="") as f:
-                    csv.writer(f).writerow(target_flat)
-            else:
-                if base_path:
-                    with open(base_path, "a", newline="") as f:
-                        csv.writer(f).writerow(base_flat)
-                with open(target_path, "a", newline="") as f:
-                    csv.writer(f).writerow(target_flat)
-        except Exception as e:
-            self._show_notification(f"⚠ Save failed: {e}", CLR_DANGER)
-            return
+        # Build the corrected image tensor for this stage
+        target_flat = [
+            1 if (self.base_data[y][x] == 1 or self.grid_data[y][x] == 1) else 0
+            for y in range(GRID_SIZE) for x in range(GRID_SIZE)
+        ]
+        corrected = torch.tensor(target_flat, dtype=torch.float32).unsqueeze(0)
 
-        self.saved_count += 1
-        self._update_counters()
+        # Store the correction in current_face_imgs and mark stage as corrected
+        self.current_face_imgs[stage] = corrected
+        self._corrected_stages.add(stage)
 
-        # Mini-retrain in background
+        # Re-composite: re-run all stages after this one using the corrected base
+        current_img = corrected
+        for s in sorted(self.models.keys()):
+            if s <= stage:
+                continue
+            z_dim = STAGE_Z_DIMS[s]
+            model = self.models[s]
+            with torch.no_grad():
+                z = torch.randn(1, z_dim)
+                condition = (current_img > RENDER_THRESHOLD).float()
+                raw = model.decode(z, condition)
+                current_img = torch.max(raw, condition)
+            self.current_face_imgs[s] = current_img.clone()
+
+        # Render the updated composite
+        img_np = current_img.view(GRID_SIZE, GRID_SIZE).numpy()
+        self._render_face(img_np)
+
+        # Return to rating view for the SAME face
         self.can_draw = False
-        self.train_status_label.config(text=f"Training... 0/{REFINE_STEPS} steps")
-
-        def do_retrain():
-            try:
-                model = self.models[stage]
-                model.train()
-                optimizer = optim.Adam(model.parameters(), lr=TRAINING_LR * 0.5)
-
-                # Load ALL training data for this stage (not just the single correction)
-                all_targets = []
-                all_bases = []
-                base_file, target_file, _ = STAGE_FILES[stage]
-
-                if os.path.exists(target_file):
-                    with open(target_file, "r") as f:
-                        for row in csv.reader(f):
-                            if len(row) == 256:
-                                all_targets.append([float(v) for v in row])
-
-                if stage > 1 and base_file and os.path.exists(base_file):
-                    with open(base_file, "r") as f:
-                        for row in csv.reader(f):
-                            if len(row) == 256:
-                                all_bases.append([float(v) for v in row])
-
-                if not all_targets:
-                    # Fallback: just use the single correction
-                    all_targets = [target_flat]
-                    all_bases = [base_flat]
-
-                target_tensor = torch.tensor(all_targets, dtype=torch.float32)
-                if stage == 1:
-                    base_tensor = torch.zeros_like(target_tensor)
-                elif all_bases:
-                    base_tensor = torch.tensor(all_bases, dtype=torch.float32)
-                else:
-                    base_tensor = torch.zeros_like(target_tensor)
-
-                for step in range(1, REFINE_STEPS + 1):
-                    optimizer.zero_grad()
-                    if stage == 1:
-                        recon, mu, logvar = model(target_tensor)
-                    else:
-                        recon, mu, logvar = model(target_tensor, base_tensor)
-
-                    conn_w = CONNECTIVITY_WEIGHT * 0.5 if stage == 1 else 0.0
-                    loss = staged_loss(recon, target_tensor, base_tensor, mu, logvar,
-                                       beta=0.3, connectivity_weight=conn_w)
-                    loss.backward()
-                    optimizer.step()
-
-                    if step % 5 == 0:
-                        try:
-                            self.after(0, lambda s=step: self.train_status_label.config(
-                                text=f"Refining on {len(all_targets)} samples... {s}/{REFINE_STEPS}"
-                            ))
-                        except Exception:
-                            break
-
-                model.eval()
-                torch.save(model.state_dict(), model_path)
-
-                # Regenerate from the fixed stage onward
-                self.after(0, self._regenerate_from_stage, stage)
-
-            except Exception as e:
-                try:
-                    self.after(0, lambda: self._show_notification(f"⚠ Training failed: {e}", CLR_DANGER))
-                except Exception:
-                    pass
-
-        thread = threading.Thread(target=do_retrain, daemon=True)
-        thread.start()
+        self.current_stage_fixing = None
+        self.edit_frame.pack_forget()
+        self.rating_frame.pack(pady=8)
+        self.instruction_label.config(
+            text=f"Correction applied. Fix more layers or Save & Train."
+        )
+        self._show_notification("✓ Applied!", CLR_SUCCESS)
 
     def _regenerate_from_stage(self, from_stage):
         """Regenerate the face from a specific stage onward."""
@@ -600,7 +625,9 @@ class RefineUI(tk.Frame):
                     if current_img is None:
                         break
                     condition = (current_img > RENDER_THRESHOLD).float()
-                    current_img = model.decode(z, condition)
+                    raw = model.decode(z, condition)
+                    # Later stages can only ADD pixels, never erase the base
+                    current_img = torch.max(raw, condition)
 
             self.current_face_imgs[stage] = current_img.clone()
 

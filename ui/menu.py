@@ -424,12 +424,12 @@ class MainMenu(tk.Frame):
                         continue
                 keep.append(i)
         else:
-            # Stages 2-4: reject if nothing new was drawn
+            # Stages 2-4: only reject if literally nothing new was drawn
             keep = []
             for i, row in enumerate(targets):
                 if bases and i < len(bases):
                     new_pixels = sum(1 for t, b in zip(row, bases[i]) if t > 0.5 and b < 0.5)
-                    if new_pixels < 3:
+                    if new_pixels < 1:
                         continue
                 keep.append(i)
 
