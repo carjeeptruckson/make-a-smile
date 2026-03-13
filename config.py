@@ -51,6 +51,10 @@ SHARPNESS_WEIGHT = 0.15
 
 # Connectivity loss (stage 1 only) — penalizes stray pixels and gaps
 CONNECTIVITY_WEIGHT = 0.3
+
+# Boundary adjacency loss (stages 2+ only) — penalizes new pixels that
+# are directly adjacent (4-connected) to the base face outline
+BOUNDARY_WEIGHT = 3.0
 CONNECTIVITY_WARMUP_START = 100
 CONNECTIVITY_WARMUP_END = 300
 

@@ -11,6 +11,13 @@ _NEIGHBOR_KERNEL = torch.tensor(
      [1, 1, 1]], dtype=torch.float32
 ).reshape(1, 1, 3, 3) / 8.0
 
+# 4-connected adjacency kernel (up/down/left/right, no diagonals)
+_ADJACENCY_KERNEL = torch.tensor(
+    [[0, 1, 0],
+     [1, 0, 1],
+     [0, 1, 0]], dtype=torch.float32
+).reshape(1, 1, 3, 3)
+
 # Directional kernels for opposing-pair gap detection.
 # Each pair detects an empty pixel with filled neighbors on opposite sides.
 _DIR_PAIRS = []
@@ -173,6 +180,36 @@ def neighbor_consistency_loss(output, stray_thresh=0.2):
     return stray + gap
 
 
+def base_boundary_loss(recon, base_image):
+    """Penalizes new pixels that are directly adjacent (4-connected) to base pixels.
+
+    For conditional stages (eyes, smile, details), the model should place new
+    features INSIDE the face, not along the outline. This computes a mask of
+    all non-base pixels that are orthogonally adjacent to a base pixel, then
+    penalizes the model's output in those locations.
+
+    Args:
+        recon: Model output (batch, 256), values in [0, 1]
+        base_image: Base/condition (batch, 256), binary
+
+    Returns:
+        Mean penalty (scalar). High when model outputs bright pixels next to base.
+    """
+    dev = recon.device
+    base_2d = base_image.view(-1, 1, GRID_SIZE, GRID_SIZE)
+    recon_2d = recon.view(-1, 1, GRID_SIZE, GRID_SIZE)
+
+    # Convolve base with cross kernel: pixels adjacent to at least one base pixel
+    adj = F.conv2d(base_2d, _ADJACENCY_KERNEL.to(dev), padding=1)
+    adjacent_to_base = (adj > 0).float()
+
+    # Boundary zone = adjacent to base AND not a base pixel itself
+    boundary_mask = adjacent_to_base * (1.0 - base_2d)
+
+    # Penalize model output in the boundary zone
+    return (recon_2d * boundary_mask).mean()
+
+
 def flood_fill_gap_score(img_tensor):
     """Score shapes by flood-filling from center through empty pixels.
 
@@ -232,7 +269,7 @@ def score_structural_quality(img_tensor):
 
 def staged_loss(recon, target, base_image, mu, logvar, beta,
                 new_pixel_weight=2.0, sharpness_weight=0.15,
-                connectivity_weight=0.0):
+                connectivity_weight=0.0, boundary_weight=0.0):
     """Loss function for staged training with pixel weighting.
 
     New pixels (present in target but not in base) are weighted higher so the
@@ -248,6 +285,7 @@ def staged_loss(recon, target, base_image, mu, logvar, beta,
         beta: KL divergence weight (from annealing schedule)
         new_pixel_weight: Extra weight for newly drawn pixels (default 2.0)
         sharpness_weight: How strongly to penalize soft/uncertain pixels
+        boundary_weight: Penalty for new pixels adjacent to base boundary (stages 2+)
 
     Returns:
         Total loss (scalar)
@@ -276,6 +314,9 @@ def staged_loss(recon, target, base_image, mu, logvar, beta,
 
     if connectivity_weight > 0:
         total = total + connectivity_weight * neighbor_consistency_loss(recon_flat)
+
+    if boundary_weight > 0:
+        total = total + boundary_weight * base_boundary_loss(recon_flat, base_flat)
 
     return total
 

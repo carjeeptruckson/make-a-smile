@@ -13,6 +13,7 @@ from config import (
     KL_WARMUP_START, KL_WARMUP_END, KL_FINAL_BETA,
     TRAINING_EPOCHS, TRAINING_LR, NOISE_FACTOR, SHARPNESS_WEIGHT,
     CONNECTIVITY_WEIGHT, CONNECTIVITY_WARMUP_START, CONNECTIVITY_WARMUP_END,
+    BOUNDARY_WEIGHT,
 )
 from model import HeadVAE, ConditionalVAE, staged_loss, kl_beta_schedule, add_noise
 
@@ -663,11 +664,15 @@ class MainMenu(tk.Frame):
                             conn_w = CONNECTIVITY_WEIGHT * conn_progress
                         else:
                             conn_w = 0.0
+                        # Boundary loss for stages 2+: penalize pixels
+                        # adjacent to the base face outline
+                        bnd_w = BOUNDARY_WEIGHT if stage > 1 else 0.0
                         loss = staged_loss(
                             recon, batch_target, batch_base, mu, logvar, beta,
                             new_pixel_weight=npw,
                             sharpness_weight=SHARPNESS_WEIGHT,
                             connectivity_weight=conn_w,
+                            boundary_weight=bnd_w,
                         )
 
                         loss.backward()
