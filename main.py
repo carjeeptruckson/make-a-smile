@@ -4,6 +4,7 @@ from ui.menu import MainMenu
 from ui.drawer import DrawerUI
 from ui.generator import GeneratorUI
 from ui.refine import RefineUI
+from ui.browser import DataBrowserUI
 
 
 class AppController(tk.Tk):
@@ -43,6 +44,7 @@ class AppController(tk.Tk):
             "Drawer": DrawerUI(self.container, self),
             "Generator": GeneratorUI(self.container, self),
             "Refine": RefineUI(self.container, self),
+            "Browser": DataBrowserUI(self.container, self),
         }
         self.show_menu()
 
@@ -62,6 +64,16 @@ class AppController(tk.Tk):
     def show_refine(self):
         self.frames["Refine"].load_model()
         self.switch_frame("Refine")
+
+    def show_browser(self, stage=1):
+        self.frames["Browser"].set_stage(stage)
+        self.switch_frame("Browser")
+
+    def show_drawer_edit(self, stage, index, target_data, base_data):
+        """Open drawer to edit an existing training sample."""
+        self.frames["Drawer"].set_stage(stage)
+        self.frames["Drawer"].load_for_edit(index, target_data, base_data)
+        self.switch_frame("Drawer")
 
     def show_generator(self):
         self.frames["Generator"].load_model()

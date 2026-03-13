@@ -54,6 +54,7 @@ class RefineUI(tk.Frame):
 
         self.grid_data = [[0] * GRID_SIZE for _ in range(GRID_SIZE)]
         self.base_data = [[0] * GRID_SIZE for _ in range(GRID_SIZE)]
+        self._corrected_drawn_pixels = {}  # stage -> flat list of user-drawn pixels
 
         self._build_ui()
 
@@ -257,6 +258,7 @@ class RefineUI(tk.Frame):
         self.can_draw = False
         self.current_stage_fixing = None
         self._corrected_stages.clear()
+        self._corrected_drawn_pixels.clear()
         self.face_count += 1
 
         # Show rating UI
@@ -562,22 +564,39 @@ class RefineUI(tk.Frame):
         ]
         corrected = torch.tensor(target_flat, dtype=torch.float32).unsqueeze(0)
 
-        # Store the correction in current_face_imgs and mark stage as corrected
+        # Store the user's drawn pixels (separate from base) so they can be
+        # re-applied if an earlier stage is corrected later
+        drawn_flat = [
+            self.grid_data[y][x]
+            for y in range(GRID_SIZE) for x in range(GRID_SIZE)
+        ]
+        self._corrected_drawn_pixels[stage] = drawn_flat
+
+        # Store the correction and mark stage as corrected
         self.current_face_imgs[stage] = corrected
         self._corrected_stages.add(stage)
 
-        # Re-composite: re-run all stages after this one using the corrected base
+        # Re-composite: rebuild all stages after this one.
+        # For stages the user already corrected, re-apply their drawn pixels
+        # on top of the new base rather than regenerating from the model.
         current_img = corrected
         for s in sorted(self.models.keys()):
             if s <= stage:
                 continue
-            z_dim = STAGE_Z_DIMS[s]
-            model = self.models[s]
-            with torch.no_grad():
-                z = torch.randn(1, z_dim)
-                condition = (current_img > RENDER_THRESHOLD).float()
-                raw = model.decode(z, condition)
-                current_img = torch.max(raw, condition)
+            if s in self._corrected_stages:
+                # Re-apply the user's drawn pixels on top of the new base
+                new_base = (current_img > RENDER_THRESHOLD).float().view(-1)
+                drawn = torch.tensor(self._corrected_drawn_pixels[s], dtype=torch.float32)
+                combined = torch.max(new_base, drawn).unsqueeze(0)
+                current_img = combined
+            else:
+                z_dim = STAGE_Z_DIMS[s]
+                model = self.models[s]
+                with torch.no_grad():
+                    z = torch.randn(1, z_dim)
+                    condition = (current_img > RENDER_THRESHOLD).float()
+                    raw = model.decode(z, condition)
+                    current_img = torch.max(raw, condition)
             self.current_face_imgs[s] = current_img.clone()
 
         # Render the updated composite

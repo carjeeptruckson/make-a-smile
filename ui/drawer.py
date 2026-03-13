@@ -36,6 +36,9 @@ class DrawerUI(tk.Frame):
         self.selected_base_index = -1
         self._thumbnail_cache = {}
 
+        # Editing existing sample support
+        self._editing_index = -1  # -1 = new drawing, >= 0 = editing row at index
+
         # Grid data: current drawing and locked base layer
         self.grid_data = [[0] * GRID_SIZE for _ in range(GRID_SIZE)]
         self.base_data = [[0] * GRID_SIZE for _ in range(GRID_SIZE)]
@@ -122,7 +125,13 @@ class DrawerUI(tk.Frame):
             gallery_inner, height=72, bg=CLR_BG_LIGHT,
             highlightthickness=0,
         )
-        self.gallery_canvas.pack(side="left", fill="x", expand=True)
+        gallery_scrollbar = ttk.Scrollbar(
+            gallery_inner, orient="horizontal",
+            command=self.gallery_canvas.xview,
+        )
+        self.gallery_canvas.configure(xscrollcommand=gallery_scrollbar.set)
+        self.gallery_canvas.pack(side="top", fill="x", expand=True)
+        gallery_scrollbar.pack(side="top", fill="x")
 
         gallery_btn_frame = tk.Frame(gallery_inner, bg=CLR_BG_LIGHT)
         gallery_btn_frame.pack(side="right", padx=(8, 0))
@@ -187,11 +196,13 @@ class DrawerUI(tk.Frame):
         """Configure the drawer for a specific stage."""
         self.current_stage = stage
         self.selected_base_index = -1
+        self._editing_index = -1
         self._thumbnail_cache = {}
 
         name = STAGE_NAMES.get(stage, f"Stage {stage}")
         icon = STAGE_ICONS.get(stage, "")
         self.stage_label.config(text=f"{icon} Stage {stage}: {name}")
+        self.save_btn.config(text="Save & Next")
         self._update_sample_count()
 
         if stage > 1:
@@ -207,6 +218,44 @@ class DrawerUI(tk.Frame):
         )
         self._clear_grid()
         self._clear_base_layer()
+
+    def load_for_edit(self, index, target_data, base_data):
+        """Load an existing sample for editing."""
+        self._editing_index = index
+        self.save_btn.config(text="Save Edit")
+
+        # Load base layer if provided
+        if base_data:
+            self.base_data = [[0] * GRID_SIZE for _ in range(GRID_SIZE)]
+            for i, val in enumerate(base_data):
+                y, x = divmod(i, GRID_SIZE)
+                self.base_data[y][x] = 1 if val > 0.5 else 0
+            self.selected_base_index = 0  # mark as having a base
+
+        # Load drawn pixels (target minus base)
+        self.grid_data = [[0] * GRID_SIZE for _ in range(GRID_SIZE)]
+        for i, val in enumerate(target_data):
+            y, x = divmod(i, GRID_SIZE)
+            is_target = val > 0.5
+            is_base = self.base_data[y][x] == 1
+            if is_target and not is_base:
+                self.grid_data[y][x] = 1
+
+        # Render
+        for y in range(GRID_SIZE):
+            for x in range(GRID_SIZE):
+                if self.grid_data[y][x] == 1:
+                    color = CLR_DRAW_PIXEL
+                elif self.base_data[y][x] == 1:
+                    color = CLR_BASE_PIXEL
+                else:
+                    color = CLR_BG
+                self.canvas.itemconfig(self.rects[y][x], fill=color)
+
+        self._update_pixel_count()
+        self.status_label.config(
+            text=f"Editing sample #{index + 1}. Modify and save."
+        )
 
     # ── Drawing ─────────────────────────────────────────────────
 
@@ -418,6 +467,21 @@ class DrawerUI(tk.Frame):
         base_path, target_path, _ = STAGE_FILES[stage]
 
         try:
+            if self._editing_index >= 0:
+                # Editing existing sample: replace row in-place
+                self._replace_csv_row(target_path, self._editing_index, target_flat)
+                if stage > 1 and base_path:
+                    self._replace_csv_row(base_path, self._editing_index, base_flat)
+
+                self._show_notification(f"✓ Sample #{self._editing_index + 1} updated", CLR_SUCCESS)
+                self._editing_index = -1
+                self.save_btn.config(text="Save & Next")
+                self.has_unsaved_changes = False
+                self._update_sample_count()
+                # Return to browser
+                self.controller.show_browser(stage)
+                return
+
             if stage == 1:
                 # Stage 1: save target only (no base conditioning)
                 with open(target_path, "a", newline="") as f:
@@ -444,6 +508,21 @@ class DrawerUI(tk.Frame):
 
         except Exception as e:
             self._show_notification(f"⚠ Save failed: {e}", CLR_DANGER)
+
+    @staticmethod
+    def _replace_csv_row(path, index, new_row):
+        """Replace a specific row in a CSV file."""
+        rows = []
+        if os.path.exists(path):
+            with open(path, "r") as f:
+                for row in csv.reader(f):
+                    rows.append(row)
+        if index < len(rows):
+            rows[index] = [str(v) for v in new_row]
+        with open(path, "w", newline="") as f:
+            writer = csv.writer(f)
+            for row in rows:
+                writer.writerow(row)
 
     def _show_notification(self, text, color):
         """Show a brief notification that fades after 2 seconds."""

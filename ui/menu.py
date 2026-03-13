@@ -92,7 +92,7 @@ class MainMenu(tk.Frame):
             (1, {"title": "📝 Draw Heads", "desc": "Draw head shapes to teach the AI", "action": "draw"}),
             (2, {"title": "📝 Draw Eyes", "desc": "Add eyes to head shapes", "action": "draw"}),
             (3, {"title": "📝 Draw Smiles", "desc": "Add smiles to head+eyes", "action": "draw"}),
-            (4, {"title": "✨ Create Faces", "desc": "Generate and explore faces", "action": "generate"}),
+            (4, {"title": "📝 Draw Details", "desc": "Add final details to faces", "action": "draw"}),
         ]):
             row, col = divmod(i, 2)
             card = self._build_action_card(cards_frame, stage, info)
@@ -102,6 +102,35 @@ class MainMenu(tk.Frame):
         cards_frame.grid_columnconfigure(1, weight=1)
         cards_frame.grid_rowconfigure(0, weight=1)
         cards_frame.grid_rowconfigure(1, weight=1)
+
+        # ── Generate & Refine bar ──────────────────────────────────
+        gen_bar = tk.Frame(right, bg=CLR_BG_LIGHT, padx=16, pady=12,
+                           highlightbackground=CLR_BORDER, highlightthickness=1)
+        gen_bar.pack(fill="x", pady=(12, 0))
+
+        tk.Label(
+            gen_bar, text="✨ AI Generation",
+            font=("SF Pro", 12, "bold"), fg=CLR_TEXT, bg=CLR_BG_LIGHT,
+        ).pack(side="left")
+
+        self._gen_bar_refine_btn = tk.Button(
+            gen_bar, text="🛠 Refine", font=("SF Pro", 10),
+            fg=CLR_TEXT, bg=CLR_BG, relief="solid", bd=1,
+            padx=10, pady=4, cursor="hand2",
+            highlightbackground=CLR_BORDER,
+            command=self.controller.show_refine,
+        )
+        self._gen_bar_refine_btn.pack(side="right", padx=(8, 0))
+
+        self._gen_bar_btn = tk.Button(
+            gen_bar, text="Generate Faces", font=("SF Pro", 11, "bold"),
+            fg=CLR_BG, bg=CLR_PRIMARY, activebackground=CLR_PRIMARY_HOVER,
+            activeforeground=CLR_BG,
+            relief="solid", bd=1, padx=14, pady=6, cursor="hand2",
+            highlightbackground=CLR_PRIMARY,
+            command=self.controller.show_generator,
+        )
+        self._gen_bar_btn.pack(side="right")
 
     def _build_stage_card(self, parent, stage):
         """Build a progress card for a single stage."""
@@ -174,7 +203,16 @@ class MainMenu(tk.Frame):
             highlightbackground=CLR_BORDER,
             command=lambda s=stage: self._refine_stage(s),
         )
-        refine_btn.pack(side="left")
+        refine_btn.pack(side="left", padx=(0, 4))
+
+        data_btn = tk.Button(
+            extras_row, text="📋 View Data", font=("SF Pro", 9),
+            fg=CLR_TEXT_SECONDARY, bg=CLR_BG_HOVER,
+            relief="solid", bd=1, padx=6, pady=2, cursor="hand2",
+            highlightbackground=CLR_BORDER,
+            command=lambda s=stage: self._view_data(s),
+        )
+        data_btn.pack(side="left")
 
         self.stage_cards[stage] = {
             "progress_var": progress_var,
@@ -183,6 +221,7 @@ class MainMenu(tk.Frame):
             "train_btn": train_btn,
             "preview_btn": preview_btn,
             "refine_btn": refine_btn,
+            "data_btn": data_btn,
         }
 
     def _build_action_card(self, parent, stage, info):
@@ -203,60 +242,27 @@ class MainMenu(tk.Frame):
             wraplength=220, justify="left",
         ).pack(anchor="w", pady=(4, 8))
 
-        # Progress info for drawing cards
-        if info["action"] == "draw":
-            minimum = STAGE_MIN_SAMPLES.get(stage, 30)
-            progress_label = tk.Label(
-                card, text=f"0/{minimum} samples collected",
-                font=("SF Pro", 10), fg=CLR_TEXT_MUTED, bg=CLR_BG,
-            )
-            progress_label.pack(anchor="w", pady=(0, 8))
+        minimum = STAGE_MIN_SAMPLES.get(stage, 30)
+        progress_label = tk.Label(
+            card, text=f"0/{minimum} samples collected",
+            font=("SF Pro", 10), fg=CLR_TEXT_MUTED, bg=CLR_BG,
+        )
+        progress_label.pack(anchor="w", pady=(0, 8))
 
-            btn = tk.Button(
-                card, text="Continue Drawing", font=("SF Pro", 11, "bold"),
-                fg=CLR_BG, bg=CLR_PRIMARY, activebackground=CLR_PRIMARY_HOVER,
-                activeforeground=CLR_BG,
-                relief="solid", bd=1, padx=14, pady=6, cursor="hand2",
-                highlightbackground=CLR_PRIMARY,
-                command=lambda s=stage: self._open_drawer(s),
-            )
-            btn.pack(anchor="w")
+        btn = tk.Button(
+            card, text="Continue Drawing", font=("SF Pro", 11, "bold"),
+            fg=CLR_BG, bg=CLR_PRIMARY, activebackground=CLR_PRIMARY_HOVER,
+            activeforeground=CLR_BG,
+            relief="solid", bd=1, padx=14, pady=6, cursor="hand2",
+            highlightbackground=CLR_PRIMARY,
+            command=lambda s=stage: self._open_drawer(s),
+        )
+        btn.pack(anchor="w")
 
-            # Store references for updating
-            card._progress_label = progress_label
-            card._action_btn = btn
-            card._stage = stage
-        else:
-            models_ready = sum(1 for s in range(1, 5) if self._stage_model_exists(s))
-            ready_label = tk.Label(
-                card, text=f"Models ready: {models_ready}",
-                font=("SF Pro", 10), fg=CLR_TEXT_MUTED, bg=CLR_BG,
-            )
-            ready_label.pack(anchor="w", pady=(0, 8))
-
-            gen_btn = tk.Button(
-                card, text="Generate", font=("SF Pro", 11, "bold"),
-                fg=CLR_BG, bg=CLR_PRIMARY, activebackground=CLR_PRIMARY_HOVER,
-                activeforeground=CLR_BG,
-                relief="solid", bd=1, padx=14, pady=6, cursor="hand2",
-                highlightbackground=CLR_PRIMARY,
-                command=self.controller.show_generator,
-            )
-            gen_btn.pack(anchor="w")
-
-            refine_btn = tk.Button(
-                card, text="🛠 Refine", font=("SF Pro", 10),
-                fg=CLR_TEXT, bg=CLR_BG,
-                relief="solid", bd=1, padx=10, pady=4, cursor="hand2",
-                highlightbackground=CLR_BORDER,
-                command=self.controller.show_refine,
-            )
-            refine_btn.pack(anchor="w", pady=(6, 0))
-
-            card._ready_label = ready_label
-            card._gen_btn = gen_btn
-            card._refine_btn = refine_btn
-
+        # Store references for updating
+        card._progress_label = progress_label
+        card._action_btn = btn
+        card._stage = stage
         card._info = info
         return card
 
@@ -330,39 +336,44 @@ class MainMenu(tk.Frame):
                     bg=CLR_BG_HOVER if has_model else CLR_BG,
                 )
 
+            # View Data button: enabled when there's data
+            has_data = count > 0
+            card["data_btn"].config(
+                state="normal" if has_data else "disabled",
+                fg=CLR_TEXT_SECONDARY if has_data else CLR_TEXT_MUTED,
+                bg=CLR_BG_HOVER if has_data else CLR_BG,
+            )
+
         # Update action cards
         for child in self.winfo_children():
             self._update_action_cards_recursive(child)
 
+        # Update generate bar buttons
+        has_any_model = any(self._stage_model_exists(s) for s in range(1, 5))
+        self._gen_bar_btn.config(
+            state="normal" if has_any_model else "disabled",
+            bg=CLR_PRIMARY if has_any_model else CLR_BG_HOVER,
+            fg=CLR_BG if has_any_model else CLR_TEXT_MUTED,
+        )
+        self._gen_bar_refine_btn.config(
+            state="normal" if has_any_model else "disabled",
+        )
+
     def _update_action_cards_recursive(self, widget):
         """Walk widget tree to find and update action cards."""
         if hasattr(widget, '_info'):
-            info = widget._info
-            if info["action"] == "draw":
-                stage = widget._stage
-                count = self._get_stage_sample_count(stage)
-                minimum = STAGE_MIN_SAMPLES.get(stage, 30)
-                status = self._get_stage_status(stage)
-                widget._progress_label.config(text=f"{count}/{minimum} samples collected")
+            stage = widget._stage
+            count = self._get_stage_sample_count(stage)
+            minimum = STAGE_MIN_SAMPLES.get(stage, 30)
+            status = self._get_stage_status(stage)
+            widget._progress_label.config(text=f"{count}/{minimum} samples collected")
 
-                enabled = status in ("ready", "complete")
-                widget._action_btn.config(
-                    state="normal" if enabled else "disabled",
-                    bg=CLR_PRIMARY if enabled else CLR_BG_HOVER,
-                    fg=CLR_BG if enabled else CLR_TEXT_MUTED,
-                )
-            elif info["action"] == "generate":
-                models_ready = sum(1 for s in range(1, 5) if self._stage_model_exists(s))
-                widget._ready_label.config(text=f"Models ready: {models_ready}")
-                has_any = models_ready > 0
-                widget._gen_btn.config(
-                    state="normal" if has_any else "disabled",
-                    bg=CLR_PRIMARY if has_any else CLR_BG_HOVER,
-                    fg=CLR_BG if has_any else CLR_TEXT_MUTED,
-                )
-                widget._refine_btn.config(
-                    state="normal" if has_any else "disabled",
-                )
+            enabled = status in ("ready", "complete")
+            widget._action_btn.config(
+                state="normal" if enabled else "disabled",
+                bg=CLR_PRIMARY if enabled else CLR_BG_HOVER,
+                fg=CLR_BG if enabled else CLR_TEXT_MUTED,
+            )
 
         for child in widget.winfo_children():
             self._update_action_cards_recursive(child)
@@ -393,6 +404,14 @@ class MainMenu(tk.Frame):
             messagebox.showinfo("No Model", f"Train Stage {stage} first.")
             return
         self.controller.show_refine()
+
+    def _view_data(self, stage):
+        """Open the data browser for a specific stage."""
+        count = self._get_stage_sample_count(stage)
+        if count == 0:
+            messagebox.showinfo("No Data", f"No training data for Stage {stage} yet.\nDraw some samples first!")
+            return
+        self.controller.show_browser(stage)
 
     # ── Data curation ────────────────────────────────────────────
 
