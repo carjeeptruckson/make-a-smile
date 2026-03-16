@@ -409,7 +409,8 @@ class DrawerUI(tk.Frame):
         """Handle click on a gallery thumbnail."""
         thumb_size = 64
         padding = 4
-        index = (event.x - padding) // (thumb_size + padding)
+        canvas_x = self.gallery_canvas.canvasx(event.x)
+        index = int((canvas_x - padding) // (thumb_size + padding))
 
         if 0 <= index < len(self._gallery_data):
             self.selected_base_index = index
