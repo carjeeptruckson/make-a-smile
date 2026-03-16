@@ -184,6 +184,9 @@ class DataBrowserUI(tk.Frame):
         self._load_data()
         self._render_thumbnails()
         self._update_selection_ui()
+        # Scroll to the bottom so the newest (last-saved) sample is visible
+        self.grid_canvas.update_idletasks()
+        self.grid_canvas.yview_moveto(1.0)
 
     def _load_data(self):
         """Load target (and base) CSV data for current stage."""

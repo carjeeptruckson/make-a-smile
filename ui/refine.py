@@ -32,6 +32,9 @@ CLR_DRAW_PIXEL = "#1F2937"
 
 STAGE_Z_DIMS = {1: STAGE1_Z, 2: STAGE2_Z, 3: STAGE3_Z, 4: STAGE4_Z}
 
+# Set to True to print per-stage save logs to the terminal
+DEBUG_LOGGING = False
+
 # Display scaling
 DISPLAY_SIZE = 400
 PIXEL_SIZE = DISPLAY_SIZE // GRID_SIZE
@@ -328,15 +331,20 @@ class RefineUI(tk.Frame):
     def _do_save_and_train(self):
         """Save all current layers to training data, mini-retrain corrected
         stages, then move to a new face."""
-        self._save_all_layers()
+        saved_names = self._save_all_layers()
         self.saved_count += 1
         self._update_counters()
 
         stages_to_train = list(self._corrected_stages) if self._corrected_stages else []
         self._corrected_stages.clear()
 
+        if saved_names:
+            save_msg = "💾 Saved " + ", ".join(saved_names) + "!"
+        else:
+            save_msg = "💾 Saved!"
+
         if not stages_to_train:
-            self._show_notification("💾 Saved!", CLR_SUCCESS)
+            self._show_notification(save_msg, CLR_SUCCESS)
             self.after(500, self._generate_new_face)
             return
 
@@ -422,12 +430,23 @@ class RefineUI(tk.Frame):
         self.after(600, self._generate_new_face)
 
     def _save_all_layers(self):
-        """Save the current face's layers to training data for all stages."""
-        for stage in sorted(self.current_face_imgs.keys()):
+        """Save the current face's layers to training data for ALL stages.
+
+        Returns a list of stage names that were successfully saved.
+        """
+        saved_names = []
+        stages = sorted(self.current_face_imgs.keys())
+        if not stages:
+            if DEBUG_LOGGING:
+                print("[Refine] Warning: no face images to save")
+            return saved_names
+
+        for stage in stages:
             base_path, target_path, _ = STAGE_FILES[stage]
             target_data = (self.current_face_imgs[stage] > RENDER_THRESHOLD).float()
             target_flat = target_data.view(-1).tolist()
             target_int = [int(v) for v in target_flat]
+            name = STAGE_NAMES.get(stage, f"Stage {stage}")
 
             try:
                 if stage == 1:
@@ -447,8 +466,16 @@ class RefineUI(tk.Frame):
                             csv.writer(f).writerow(base_flat)
                     with open(target_path, "a", newline="") as f:
                         csv.writer(f).writerow(target_int)
-            except Exception:
-                pass
+
+                saved_names.append(name)
+                if DEBUG_LOGGING:
+                    print(f"[Refine] Saved stage {stage} ({name}) to {target_path}")
+            except Exception as e:
+                print(f"[Refine] ERROR saving stage {stage} ({name}): {e}")
+
+        if DEBUG_LOGGING:
+            print(f"[Refine] Saved {len(saved_names)}/{len(stages)} layers: {saved_names}")
+        return saved_names
 
     # ── Edit mode ───────────────────────────────────────────────
 
