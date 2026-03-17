@@ -14,8 +14,14 @@ from config import (
     TRAINING_EPOCHS, TRAINING_LR, NOISE_FACTOR, SHARPNESS_WEIGHT,
     CONNECTIVITY_WEIGHT, CONNECTIVITY_WARMUP_START, CONNECTIVITY_WARMUP_END,
     BOUNDARY_WEIGHT,
+    STAGE_REFINE_FILES, REFINE_MIN_SAMPLES, REFINE_TRAINING_EPOCHS,
+    CRITIC_WEIGHT, CRITIC_WARMUP_END, FOCAL_ALPHA,
 )
-from model import HeadVAE, ConditionalVAE, staged_loss, kl_beta_schedule, add_noise
+from model import (
+    HeadVAE, ConditionalVAE, RefineModel,
+    staged_loss, experimental_staged_loss, refine_loss,
+    kl_beta_schedule, add_noise,
+)
 
 # Design system colors
 CLR_PRIMARY = "#3B82F6"
@@ -63,7 +69,7 @@ class MainMenu(tk.Frame):
         content.pack(fill="both", expand=True, padx=20, pady=16)
 
         # Left sidebar: Training Progress
-        sidebar = tk.Frame(content, bg=CLR_BG_LIGHT, width=320, padx=16, pady=16)
+        sidebar = tk.Frame(content, bg=CLR_BG_LIGHT, width=360, padx=16, pady=16)
         sidebar.pack(side="left", fill="y", padx=(0, 16))
         sidebar.pack_propagate(False)
 
@@ -184,6 +190,36 @@ class MainMenu(tk.Frame):
         )
         train_btn.pack(side="right")
 
+        # ── Refine AI row ──
+        refine_row = tk.Frame(card, bg=CLR_BG)
+        refine_row.pack(fill="x", pady=(4, 0))
+
+        refine_status = tk.Label(
+            refine_row, text="Refine ● —",
+            font=("SF Pro", 9), fg=CLR_TEXT_MUTED, bg=CLR_BG,
+        )
+        refine_status.pack(side="left")
+
+        train_experimental_btn = tk.Button(
+            refine_row, text="Train (Exp)", font=("SF Pro", 9, "bold"),
+            fg=CLR_BG, bg="#8B5CF6", activebackground="#7C3AED",
+            activeforeground=CLR_BG,
+            relief="solid", bd=1, padx=8, pady=2, cursor="hand2",
+            highlightbackground="#8B5CF6",
+            command=lambda s=stage: self._train_experimental(s),
+        )
+        train_experimental_btn.pack(side="right", padx=(4, 0))
+
+        train_refine_btn = tk.Button(
+            refine_row, text="Train Refine", font=("SF Pro", 9, "bold"),
+            fg=CLR_BG, bg=CLR_WARNING, activebackground="#D97706",
+            activeforeground=CLR_BG,
+            relief="solid", bd=1, padx=8, pady=2, cursor="hand2",
+            highlightbackground=CLR_WARNING,
+            command=lambda s=stage: self._train_refine(s),
+        )
+        train_refine_btn.pack(side="right")
+
         # Preview / Refine buttons (shown when model is trained)
         extras_row = tk.Frame(card, bg=CLR_BG)
         extras_row.pack(fill="x", pady=(4, 0))
@@ -220,6 +256,9 @@ class MainMenu(tk.Frame):
             "status_text": status_text,
             "status_indicator": status_indicator,
             "train_btn": train_btn,
+            "train_refine_btn": train_refine_btn,
+            "train_experimental_btn": train_experimental_btn,
+            "refine_status": refine_status,
             "preview_btn": preview_btn,
             "refine_btn": refine_btn,
             "data_btn": data_btn,
@@ -282,9 +321,25 @@ class MainMenu(tk.Frame):
         except Exception:
             return 0
 
+    def _get_refine_sample_count(self, stage):
+        """Count rows in a stage's refine target data file."""
+        _, _, target_path, _ = STAGE_REFINE_FILES[stage]
+        if not os.path.exists(target_path):
+            return 0
+        try:
+            with open(target_path, "r") as f:
+                return sum(1 for _ in f)
+        except Exception:
+            return 0
+
     def _stage_model_exists(self, stage):
         """Check if a trained model exists for this stage."""
         _, _, model_path = STAGE_FILES[stage]
+        return os.path.exists(model_path)
+
+    def _refine_model_exists(self, stage):
+        """Check if a trained refine model exists for this stage."""
+        _, _, _, model_path = STAGE_REFINE_FILES[stage]
         return os.path.exists(model_path)
 
     def _get_stage_status(self, stage):
@@ -308,6 +363,9 @@ class MainMenu(tk.Frame):
             count = self._get_stage_sample_count(stage)
             minimum = STAGE_MIN_SAMPLES.get(stage, 30)
             status = self._get_stage_status(stage)
+            refine_count = self._get_refine_sample_count(stage)
+            has_refine_model = self._refine_model_exists(stage)
+            has_vae_model = self._stage_model_exists(stage)
 
             card["progress_var"].set(min(count, minimum))
             card["status_text"].config(text=f"{count} / {minimum} samples")
@@ -328,8 +386,41 @@ class MainMenu(tk.Frame):
                 fg=CLR_BG if can_train else CLR_TEXT_MUTED,
             )
 
+            # ── Refine AI status & buttons ──
+            if has_refine_model:
+                card["refine_status"].config(
+                    fg=CLR_SUCCESS,
+                    text=f"Refine ● Trained ({refine_count} samples)",
+                )
+            elif refine_count > 0:
+                card["refine_status"].config(
+                    fg=CLR_WARNING,
+                    text=f"Refine ● {refine_count}/{REFINE_MIN_SAMPLES}",
+                )
+            else:
+                card["refine_status"].config(
+                    fg=CLR_TEXT_MUTED,
+                    text="Refine ● No data",
+                )
+
+            # Train Refine: enabled when VAE trained + enough refine data
+            can_train_refine = has_vae_model and refine_count >= REFINE_MIN_SAMPLES
+            card["train_refine_btn"].config(
+                state="normal" if can_train_refine else "disabled",
+                bg=CLR_WARNING if can_train_refine else CLR_BG_HOVER,
+                fg=CLR_BG if can_train_refine else CLR_TEXT_MUTED,
+            )
+
+            # Train Experimental: enabled when VAE trained + RefineModel trained
+            can_train_exp = has_vae_model and has_refine_model
+            card["train_experimental_btn"].config(
+                state="normal" if can_train_exp else "disabled",
+                bg="#8B5CF6" if can_train_exp else CLR_BG_HOVER,
+                fg=CLR_BG if can_train_exp else CLR_TEXT_MUTED,
+            )
+
             # Preview / Refine buttons: only if model trained
-            has_model = self._stage_model_exists(stage)
+            has_model = has_vae_model
             for btn_key in ("preview_btn", "refine_btn"):
                 card[btn_key].config(
                     state="normal" if has_model else "disabled",
@@ -759,6 +850,546 @@ class MainMenu(tk.Frame):
                     command=lambda: (_close_modal(), self.controller.show_generator()),
                 ).pack(side="left", padx=4)
 
+            except Exception:
+                pass
+
+        def _training_cancelled():
+            try:
+                status_label.config(text="Training cancelled.", fg=CLR_DANGER)
+                modal.after(1500, _close_modal)
+            except Exception:
+                pass
+
+        def _training_error(msg):
+            try:
+                status_label.config(text=f"Error: {msg}", fg=CLR_DANGER)
+            except Exception:
+                pass
+
+        def _close_modal():
+            try:
+                modal.grab_release()
+                modal.destroy()
+                self.update_stats()
+            except Exception:
+                pass
+
+        thread = threading.Thread(target=do_train, daemon=True)
+        thread.start()
+
+    # ── Refine AI Training ──────────────────────────────────────
+
+    def _train_refine(self, stage):
+        """Full training of the RefineModel for a stage."""
+        refine_count = self._get_refine_sample_count(stage)
+        if refine_count < REFINE_MIN_SAMPLES:
+            messagebox.showwarning(
+                "Not Enough Refine Data",
+                f"Stage {stage} refine needs at least {REFINE_MIN_SAMPLES} samples.\n"
+                f"You have {refine_count}. Keep refining faces!"
+            )
+            return
+
+        if self._training:
+            messagebox.showinfo("Training", "A training session is already in progress.")
+            return
+
+        self._training = True
+        name = STAGE_NAMES.get(stage, f"Stage {stage}")
+        input_csv, base_csv, target_csv, model_path = STAGE_REFINE_FILES[stage]
+
+        # ── Training modal ──
+        modal = tk.Toplevel(self)
+        modal.title(f"Training Refine Model: {name}")
+        modal.geometry("500x400")
+        modal.configure(bg=CLR_BG)
+        modal.transient(self.winfo_toplevel())
+        modal.grab_set()
+
+        tk.Label(
+            modal, text=f"Training Refine AI: {name}",
+            font=("SF Pro", 16, "bold"), fg=CLR_TEXT, bg=CLR_BG,
+        ).pack(pady=(20, 4))
+
+        tk.Label(
+            modal, text=f"Training on {refine_count} correction samples",
+            font=("SF Pro", 11), fg=CLR_TEXT_SECONDARY, bg=CLR_BG,
+        ).pack(pady=(0, 16))
+
+        epoch_label = tk.Label(
+            modal, text="Epoch 0 / 400",
+            font=("SF Pro", 32, "bold"), fg=CLR_WARNING, bg=CLR_BG,
+        )
+        epoch_label.pack(pady=8)
+
+        loss_label = tk.Label(
+            modal, text="Loss: —",
+            font=("SF Pro", 13), fg=CLR_TEXT, bg=CLR_BG,
+        )
+        loss_label.pack()
+
+        progress_var = tk.DoubleVar()
+        ttk.Progressbar(
+            modal, variable=progress_var, maximum=REFINE_TRAINING_EPOCHS, length=400,
+        ).pack(pady=(16, 4))
+
+        cancel_var = {"cancelled": False}
+        cancel_btn = tk.Button(
+            modal, text="Cancel", font=("SF Pro", 11, "bold"),
+            fg=CLR_BG, bg=CLR_DANGER, activebackground="#DC2626",
+            activeforeground=CLR_BG,
+            relief="solid", bd=1, padx=16, pady=6, cursor="hand2",
+            highlightbackground=CLR_DANGER,
+            command=lambda: cancel_var.update({"cancelled": True}),
+        )
+        cancel_btn.pack(pady=12)
+
+        status_label = tk.Label(
+            modal, text="", font=("SF Pro", 12, "bold"),
+            fg=CLR_SUCCESS, bg=CLR_BG,
+        )
+        status_label.pack()
+
+        def do_train():
+            try:
+                # Load refine data
+                inputs, bases, targets = [], [], []
+                for path, dest in [(input_csv, inputs), (base_csv, bases), (target_csv, targets)]:
+                    if os.path.exists(path):
+                        with open(path, "r") as f:
+                            for row in csv.reader(f):
+                                if len(row) == 256:
+                                    dest.append([float(v) for v in row])
+
+                min_len = min(len(inputs), len(bases), len(targets))
+                if min_len == 0:
+                    raise ValueError("No valid refine data found")
+
+                input_t = torch.tensor(inputs[-min_len:], dtype=torch.float32)
+                base_t = torch.tensor(bases[-min_len:], dtype=torch.float32)
+                target_t = torch.tensor(targets[-min_len:], dtype=torch.float32)
+
+                # Augmentation: horizontal flip
+                aug_inputs, aug_bases, aug_targets = [], [], []
+                for i in range(min_len):
+                    aug_inputs.append(input_t[i])
+                    aug_bases.append(base_t[i])
+                    aug_targets.append(target_t[i])
+                    # Flipped versions
+                    aug_inputs.append(input_t[i].view(GRID_SIZE, GRID_SIZE).flip(1).flatten())
+                    aug_bases.append(base_t[i].view(GRID_SIZE, GRID_SIZE).flip(1).flatten())
+                    aug_targets.append(target_t[i].view(GRID_SIZE, GRID_SIZE).flip(1).flatten())
+
+                input_t = torch.stack(aug_inputs)
+                base_t = torch.stack(aug_bases)
+                target_t = torch.stack(aug_targets)
+
+                model = RefineModel()
+                if os.path.exists(model_path):
+                    try:
+                        model.load_state_dict(torch.load(model_path, weights_only=True))
+                    except Exception:
+                        pass
+
+                optimizer = optim.Adam(model.parameters(), lr=TRAINING_LR)
+                scheduler = optim.lr_scheduler.CosineAnnealingLR(
+                    optimizer, T_max=REFINE_TRAINING_EPOCHS, eta_min=TRAINING_LR * 0.05,
+                )
+
+                n_samples = input_t.shape[0]
+                batch_size = min(32, n_samples)
+
+                for epoch in range(1, REFINE_TRAINING_EPOCHS + 1):
+                    if cancel_var["cancelled"]:
+                        break
+
+                    model.train()
+                    perm = torch.randperm(n_samples)
+                    epoch_loss = 0.0
+                    n_batches = 0
+
+                    for start in range(0, n_samples, batch_size):
+                        idx = perm[start:start + batch_size]
+                        bi, bb, bt = input_t[idx], base_t[idx], target_t[idx]
+
+                        optimizer.zero_grad()
+                        pred = model(bi, bb)
+                        loss = refine_loss(pred, bt)
+                        loss.backward()
+                        torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+                        optimizer.step()
+
+                        epoch_loss += loss.item()
+                        n_batches += 1
+
+                    scheduler.step()
+
+                    if epoch % 5 == 0 or epoch == 1:
+                        avg_loss = epoch_loss / max(n_batches, 1)
+                        try:
+                            modal.after(0, lambda e=epoch, l=avg_loss: _update_ui(e, l))
+                        except Exception:
+                            break
+
+                if not cancel_var["cancelled"]:
+                    torch.save(model.state_dict(), model_path)
+                    try:
+                        modal.after(0, _training_complete)
+                    except Exception:
+                        pass
+                else:
+                    try:
+                        modal.after(0, _training_cancelled)
+                    except Exception:
+                        pass
+
+            except Exception as e:
+                try:
+                    modal.after(0, lambda: _training_error(str(e)))
+                except Exception:
+                    pass
+            finally:
+                self._training = False
+
+        def _update_ui(epoch, loss):
+            try:
+                epoch_label.config(text=f"Epoch {epoch} / {REFINE_TRAINING_EPOCHS}")
+                loss_label.config(text=f"Loss: {loss:.4f}")
+                progress_var.set(epoch)
+            except Exception:
+                pass
+
+        def _training_complete():
+            try:
+                cancel_btn.config(state="disabled")
+                status_label.config(text="✓ Refine model trained!")
+                epoch_label.config(text="Done!", fg=CLR_SUCCESS)
+                tk.Button(
+                    modal, text="Close", font=("SF Pro", 11),
+                    fg=CLR_TEXT, bg=CLR_BG, relief="solid", bd=1,
+                    padx=12, pady=6, cursor="hand2",
+                    highlightbackground=CLR_BORDER,
+                    command=_close_modal,
+                ).pack(pady=8)
+            except Exception:
+                pass
+
+        def _training_cancelled():
+            try:
+                status_label.config(text="Training cancelled.", fg=CLR_DANGER)
+                modal.after(1500, _close_modal)
+            except Exception:
+                pass
+
+        def _training_error(msg):
+            try:
+                status_label.config(text=f"Error: {msg}", fg=CLR_DANGER)
+            except Exception:
+                pass
+
+        def _close_modal():
+            try:
+                modal.grab_release()
+                modal.destroy()
+                self.update_stats()
+            except Exception:
+                pass
+
+        thread = threading.Thread(target=do_train, daemon=True)
+        thread.start()
+
+    def _train_experimental(self, stage):
+        """Experimental training: retrain VAE using RefineModel as a live critic."""
+        if not self._refine_model_exists(stage):
+            messagebox.showwarning(
+                "No Refine Model",
+                f"Train the Refine model for stage {stage} first."
+            )
+            return
+
+        count = self._get_stage_sample_count(stage)
+        minimum = STAGE_MIN_SAMPLES.get(stage, 30)
+        if count < minimum:
+            messagebox.showwarning(
+                "Not Enough Data",
+                f"Stage {stage} needs at least {minimum} samples.\n"
+                f"You have {count}."
+            )
+            return
+
+        if self._training:
+            messagebox.showinfo("Training", "A training session is already in progress.")
+            return
+
+        self._training = True
+        name = STAGE_NAMES.get(stage, f"Stage {stage}")
+
+        # ── Training modal ──
+        modal = tk.Toplevel(self)
+        modal.title(f"Experimental Training: {name}")
+        modal.geometry("500x440")
+        modal.configure(bg=CLR_BG)
+        modal.transient(self.winfo_toplevel())
+        modal.grab_set()
+
+        tk.Label(
+            modal, text=f"⚡ Experimental: {name}",
+            font=("SF Pro", 16, "bold"), fg="#8B5CF6", bg=CLR_BG,
+        ).pack(pady=(20, 4))
+
+        tk.Label(
+            modal, text=f"VAE + Critic training on {count} samples",
+            font=("SF Pro", 11), fg=CLR_TEXT_SECONDARY, bg=CLR_BG,
+        ).pack(pady=(0, 4))
+
+        tk.Label(
+            modal, text="RefineModel acts as a live critic to guide the VAE",
+            font=("SF Pro", 10), fg=CLR_TEXT_MUTED, bg=CLR_BG,
+        ).pack(pady=(0, 16))
+
+        epoch_label = tk.Label(
+            modal, text="Epoch 0 / 500",
+            font=("SF Pro", 32, "bold"), fg="#8B5CF6", bg=CLR_BG,
+        )
+        epoch_label.pack(pady=8)
+
+        loss_label = tk.Label(
+            modal, text="Loss: —  |  Critic: —",
+            font=("SF Pro", 13), fg=CLR_TEXT, bg=CLR_BG,
+        )
+        loss_label.pack()
+
+        beta_label = tk.Label(
+            modal, text="KL β: 0.000  |  Critic ramp: 0%",
+            font=("SF Pro", 11), fg=CLR_TEXT_SECONDARY, bg=CLR_BG,
+        )
+        beta_label.pack(pady=(4, 16))
+
+        progress_var = tk.DoubleVar()
+        ttk.Progressbar(
+            modal, variable=progress_var, maximum=TRAINING_EPOCHS, length=400,
+        ).pack(pady=4)
+
+        cancel_var = {"cancelled": False}
+        cancel_btn = tk.Button(
+            modal, text="Cancel", font=("SF Pro", 11, "bold"),
+            fg=CLR_BG, bg=CLR_DANGER, activebackground="#DC2626",
+            activeforeground=CLR_BG,
+            relief="solid", bd=1, padx=16, pady=6, cursor="hand2",
+            highlightbackground=CLR_DANGER,
+            command=lambda: cancel_var.update({"cancelled": True}),
+        )
+        cancel_btn.pack(pady=12)
+
+        status_label = tk.Label(
+            modal, text="", font=("SF Pro", 12, "bold"),
+            fg=CLR_SUCCESS, bg=CLR_BG,
+        )
+        status_label.pack()
+
+        def do_train():
+            try:
+                base_path, target_path, model_path = STAGE_FILES[stage]
+                _, _, _, refine_model_path = STAGE_REFINE_FILES[stage]
+
+                # Load VAE training data
+                targets, bases = [], []
+                with open(target_path, "r") as f:
+                    for row in csv.reader(f):
+                        if len(row) == 256:
+                            targets.append([float(v) for v in row])
+
+                if stage > 1 and base_path and os.path.exists(base_path):
+                    with open(base_path, "r") as f:
+                        for row in csv.reader(f):
+                            if len(row) == 256:
+                                bases.append([float(v) for v in row])
+
+                # Curate
+                targets, bases, n_removed = self._curate_training_data(targets, bases, stage)
+                if n_removed > 0:
+                    try:
+                        modal.after(0, lambda n=n_removed: status_label.config(
+                            text=f"Cleaned: removed {n} bad sample(s)", fg=CLR_WARNING))
+                    except Exception:
+                        pass
+
+                # Augmentation
+                aug_targets, aug_bases = [], []
+                for i, t in enumerate(targets):
+                    aug_targets.append(t)
+                    grid = np.array(t).reshape(GRID_SIZE, GRID_SIZE)
+                    aug_targets.append(np.fliplr(grid).flatten().tolist())
+                    if bases:
+                        b = bases[i] if i < len(bases) else [0.0] * 256
+                        aug_bases.append(b)
+                        bgrid = np.array(b).reshape(GRID_SIZE, GRID_SIZE)
+                        aug_bases.append(np.fliplr(bgrid).flatten().tolist())
+
+                target_tensor = torch.tensor(aug_targets, dtype=torch.float32)
+                if stage == 1:
+                    base_tensor = torch.zeros_like(target_tensor)
+                else:
+                    base_tensor = (torch.tensor(aug_bases, dtype=torch.float32)
+                                   if aug_bases else torch.zeros_like(target_tensor))
+
+                # Create fresh VAE model
+                if stage == 1:
+                    model = HeadVAE()
+                else:
+                    model = ConditionalVAE(stage_name=f"stage{stage}")
+
+                # Load existing weights as starting point
+                if os.path.exists(model_path):
+                    try:
+                        import shutil
+                        shutil.copy2(model_path, model_path + ".bak")
+                        model.load_state_dict(torch.load(model_path, weights_only=True))
+                    except Exception:
+                        pass
+
+                # Load the frozen RefineModel (critic)
+                refine_model = RefineModel()
+                refine_model.load_state_dict(torch.load(refine_model_path, weights_only=True))
+                refine_model.eval()
+                for param in refine_model.parameters():
+                    param.requires_grad = False
+
+                optimizer = optim.Adam(model.parameters(), lr=TRAINING_LR)
+                scheduler = optim.lr_scheduler.CosineAnnealingLR(
+                    optimizer, T_max=TRAINING_EPOCHS, eta_min=TRAINING_LR * 0.05,
+                )
+
+                n_samples = target_tensor.shape[0]
+                batch_size = min(32, n_samples)
+
+                for epoch in range(1, TRAINING_EPOCHS + 1):
+                    if cancel_var["cancelled"]:
+                        break
+
+                    model.train()
+                    perm = torch.randperm(n_samples)
+                    epoch_loss = 0.0
+                    n_batches = 0
+
+                    # Critic warmup: ramp from 0 to 1 over CRITIC_WARMUP_END epochs
+                    critic_progress = min(1.0, epoch / CRITIC_WARMUP_END) if CRITIC_WARMUP_END > 0 else 1.0
+
+                    for start in range(0, n_samples, batch_size):
+                        idx = perm[start:start + batch_size]
+                        batch_target = target_tensor[idx]
+                        batch_base = base_tensor[idx]
+
+                        optimizer.zero_grad()
+
+                        noisy_target = add_noise(batch_target, noise_factor=NOISE_FACTOR)
+
+                        if stage == 1:
+                            recon, mu, logvar = model(noisy_target)
+                        else:
+                            recon, mu, logvar = model(noisy_target, batch_base)
+
+                        # KL annealing (slightly lower beta for experimental to preserve diversity)
+                        beta = kl_beta_schedule(
+                            epoch, KL_WARMUP_START, KL_WARMUP_END, KL_FINAL_BETA * 0.8,
+                        )
+                        npw = 1.0 if stage == 1 else 2.0
+
+                        if stage == 1 and epoch > CONNECTIVITY_WARMUP_START:
+                            conn_progress = min(1.0, (epoch - CONNECTIVITY_WARMUP_START)
+                                                / (CONNECTIVITY_WARMUP_END - CONNECTIVITY_WARMUP_START))
+                            conn_w = CONNECTIVITY_WEIGHT * conn_progress
+                        else:
+                            conn_w = 0.0
+
+                        bnd_w = BOUNDARY_WEIGHT if stage > 1 else 0.0
+
+                        loss = experimental_staged_loss(
+                            recon, batch_target, batch_base, mu, logvar, beta,
+                            refine_model=refine_model,
+                            critic_weight=CRITIC_WEIGHT,
+                            critic_warmup_progress=critic_progress,
+                            focal_alpha=FOCAL_ALPHA,
+                            new_pixel_weight=npw,
+                            sharpness_weight=SHARPNESS_WEIGHT,
+                            connectivity_weight=conn_w,
+                            boundary_weight=bnd_w,
+                        )
+
+                        loss.backward()
+                        torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+                        optimizer.step()
+
+                        epoch_loss += loss.item()
+                        n_batches += 1
+
+                    scheduler.step()
+
+                    if epoch % 5 == 0 or epoch == 1:
+                        avg_loss = epoch_loss / max(n_batches, 1)
+                        try:
+                            modal.after(0, lambda e=epoch, l=avg_loss, b=beta, cp=critic_progress:
+                                        _update_ui(e, l, b, cp))
+                        except Exception:
+                            break
+
+                if not cancel_var["cancelled"]:
+                    torch.save(model.state_dict(), model_path)
+                    try:
+                        modal.after(0, _training_complete)
+                    except Exception:
+                        pass
+                else:
+                    try:
+                        modal.after(0, _training_cancelled)
+                    except Exception:
+                        pass
+
+            except Exception as e:
+                import traceback
+                traceback.print_exc()
+                try:
+                    modal.after(0, lambda: _training_error(str(e)))
+                except Exception:
+                    pass
+            finally:
+                self._training = False
+
+        def _update_ui(epoch, loss, beta, critic_progress):
+            try:
+                epoch_label.config(text=f"Epoch {epoch} / {TRAINING_EPOCHS}")
+                loss_label.config(text=f"Loss: {loss:.4f}")
+                beta_label.config(
+                    text=f"KL β: {beta:.3f}  |  Critic ramp: {int(critic_progress * 100)}%")
+                progress_var.set(epoch)
+            except Exception:
+                pass
+
+        def _training_complete():
+            try:
+                cancel_btn.config(state="disabled")
+                status_label.config(text="✓ Experimental training complete!")
+                epoch_label.config(text="Done!", fg=CLR_SUCCESS)
+
+                btn_frame = tk.Frame(modal, bg=CLR_BG)
+                btn_frame.pack(pady=8)
+
+                tk.Button(
+                    btn_frame, text="Close", font=("SF Pro", 11),
+                    fg=CLR_TEXT, bg=CLR_BG, relief="solid", bd=1,
+                    padx=12, pady=6, cursor="hand2",
+                    highlightbackground=CLR_BORDER,
+                    command=_close_modal,
+                ).pack(side="left", padx=4)
+
+                tk.Button(
+                    btn_frame, text="See Results →",
+                    font=("SF Pro", 11, "bold"),
+                    fg=CLR_BG, bg=CLR_SUCCESS, relief="solid", bd=1,
+                    padx=12, pady=6, cursor="hand2",
+                    highlightbackground=CLR_SUCCESS, activeforeground=CLR_BG,
+                    command=lambda: (_close_modal(), self.controller.show_generator()),
+                ).pack(side="left", padx=4)
             except Exception:
                 pass
 

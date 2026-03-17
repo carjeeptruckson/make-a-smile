@@ -321,6 +321,174 @@ def staged_loss(recon, target, base_image, mu, logvar, beta,
     return total
 
 
+# ── Refine AI ────────────────────────────────────────────────────
+
+
+class RefineModel(nn.Module):
+    """Learns to predict user corrections for a stage's VAE output.
+
+    Input:  256 (generator raw output) + 256 (base/condition) = 512
+    Hidden: 512 → 256 → 256 (ReLU + BatchNorm)
+    Output: 256 (sigmoid → predicted corrected pixels)
+    """
+
+    def __init__(self):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Linear(512, 256),
+            nn.BatchNorm1d(256),
+            nn.ReLU(),
+            nn.Linear(256, 256),
+            nn.BatchNorm1d(256),
+            nn.ReLU(),
+            nn.Linear(256, 256),
+            nn.Sigmoid(),
+        )
+
+    def forward(self, generator_output, base):
+        """Predict corrected pixels given generator output and base layer.
+
+        Args:
+            generator_output: Raw VAE output (batch, 256), values in [0, 1]
+            base: Base/condition from previous stage (batch, 256), binary
+
+        Returns:
+            Predicted corrected pixels (batch, 256), values in [0, 1]
+        """
+        gen_flat = generator_output.view(-1, 256)
+        base_flat = base.view(-1, 256)
+        combined = torch.cat([gen_flat, base_flat], dim=1)
+        return self.net(combined)
+
+
+def refine_loss(prediction, target, new_pixel_weight=2.0):
+    """BCE loss between RefineModel prediction and the user's actual correction.
+
+    Applies higher weight to pixels that were changed by the user (new pixels
+    present in target but not in the generator's original output).
+
+    Args:
+        prediction: RefineModel output (batch, 256)
+        target: User's actual corrected pixels (batch, 256)
+        new_pixel_weight: Extra weight for changed pixels
+
+    Returns:
+        Weighted BCE loss (scalar)
+    """
+    pred_flat = prediction.view(-1, 256)
+    target_flat = target.view(-1, 256)
+
+    bce = F.binary_cross_entropy(pred_flat, target_flat, reduction='none')
+
+    # Weight pixels that differ between prediction input and target more heavily
+    changed = (target_flat > 0.5) != (pred_flat.detach() > 0.5)
+    weight_mask = torch.ones_like(bce)
+    weight_mask[changed] = new_pixel_weight
+
+    return (bce * weight_mask).mean()
+
+
+def critic_correction_magnitude(refine_model, vae_output, base):
+    """Compute per-sample correction magnitude from the RefineModel.
+
+    This measures how much the RefineModel thinks each sample needs
+    to be corrected. Higher values = the critic thinks this output is worse.
+
+    Args:
+        refine_model: Trained RefineModel (will be used in eval/no_grad mode)
+        vae_output: Raw VAE output (batch, 256)
+        base: Base/condition (batch, 256)
+
+    Returns:
+        Per-sample correction magnitude (batch,), values >= 0
+    """
+    with torch.no_grad():
+        refine_model.eval()
+        predicted_correction = refine_model(vae_output, base)
+
+    # L1 difference per sample: how many pixels the critic would change
+    diff = torch.abs(predicted_correction - vae_output.view(-1, 256))
+    return diff.mean(dim=1)  # (batch,)
+
+
+def experimental_staged_loss(recon, target, base_image, mu, logvar, beta,
+                             refine_model=None, critic_weight=0.0,
+                             critic_warmup_progress=1.0, focal_alpha=2.0,
+                             new_pixel_weight=2.0, sharpness_weight=0.15,
+                             connectivity_weight=0.0, boundary_weight=0.0):
+    """Extended staged_loss with RefineModel critic signal.
+
+    Adds two mechanisms on top of the standard loss:
+    1. Per-sample focal weighting: samples the critic thinks are bad get
+       quadratically higher loss weight (hard-example mining).
+    2. Critic loss term: direct penalty proportional to how much the
+       critic would correct the output.
+
+    Args:
+        recon: VAE reconstructed output (batch, 256)
+        target: Target image (batch, 256)
+        base_image: Base/condition (batch, 256)
+        mu, logvar: Latent parameters
+        beta: KL weight
+        refine_model: Trained RefineModel (or None to skip critic)
+        critic_weight: Weight of the critic loss term
+        critic_warmup_progress: 0→1 ramp for critic (0=off, 1=full)
+        focal_alpha: Quadratic scaling for hard-example weighting
+        (remaining args same as staged_loss)
+
+    Returns:
+        Total loss (scalar)
+    """
+    target_flat = target.view(-1, 256)
+    base_flat = base_image.view(-1, 256)
+    recon_flat = recon.view(-1, 256)
+
+    # ── Standard VAE loss components ──
+    bce = F.binary_cross_entropy(recon_flat, target_flat, reduction='none')
+
+    new_pixels = (target_flat > 0.5) & (base_flat < 0.5)
+    weight_mask = torch.ones_like(bce)
+    weight_mask[new_pixels] = new_pixel_weight
+
+    # Per-sample weighted BCE (keep per-sample for focal weighting)
+    per_sample_bce = (bce * weight_mask).mean(dim=1)  # (batch,)
+
+    kld = -0.5 * torch.mean(1 + logvar - mu.pow(2) - logvar.exp())
+    sharp = sharpening_loss(recon_flat)
+
+    # ── Critic-guided components ──
+    if refine_model is not None and critic_weight > 0 and critic_warmup_progress > 0:
+        correction_mag = critic_correction_magnitude(refine_model, recon, base_image)
+
+        # Focal weighting: weight = 1 + α * correction_magnitude²
+        # Slightly wrong → small bump, very wrong → heavy punishment
+        focal_weights = 1.0 + focal_alpha * (correction_mag ** 2)
+        focal_weights = focal_weights / focal_weights.mean()  # normalize
+
+        # Apply focal weights to per-sample BCE
+        weighted_bce = (per_sample_bce * focal_weights).mean()
+
+        # Direct critic penalty: push VAE to minimize correction magnitude
+        critic_penalty = correction_mag.mean()
+
+        effective_critic_weight = critic_weight * critic_warmup_progress
+    else:
+        weighted_bce = per_sample_bce.mean()
+        critic_penalty = torch.tensor(0.0, device=recon.device)
+        effective_critic_weight = 0.0
+
+    total = weighted_bce + beta * kld + sharpness_weight * sharp
+    total = total + effective_critic_weight * critic_penalty
+
+    if connectivity_weight > 0:
+        total = total + connectivity_weight * neighbor_consistency_loss(recon_flat)
+
+    if boundary_weight > 0:
+        total = total + boundary_weight * base_boundary_loss(recon_flat, base_flat)
+
+    return total
+
+
 def kl_beta_schedule(epoch, warmup_start=100, warmup_end=400, final_beta=0.8):
     """Linear KL annealing schedule.
 

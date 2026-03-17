@@ -89,3 +89,47 @@ STAGE_FILES = {
     3: (STAGE3_BASE_DATA, STAGE3_TARGET_DATA, MODEL_STAGE3),
     4: (STAGE4_BASE_DATA, STAGE4_TARGET_DATA, MODEL_STAGE4),
 }
+
+# ── Refine AI ────────────────────────────────────────────────────
+
+# Refine data files (per stage):  input_csv, base_csv, target_csv
+STAGE1_REFINE_INPUT = os.path.join(DATA_DIR, "stage1_refine_input.csv")
+STAGE1_REFINE_BASE = os.path.join(DATA_DIR, "stage1_refine_base.csv")
+STAGE1_REFINE_TARGET = os.path.join(DATA_DIR, "stage1_refine_target.csv")
+
+STAGE2_REFINE_INPUT = os.path.join(DATA_DIR, "stage2_refine_input.csv")
+STAGE2_REFINE_BASE = os.path.join(DATA_DIR, "stage2_refine_base.csv")
+STAGE2_REFINE_TARGET = os.path.join(DATA_DIR, "stage2_refine_target.csv")
+
+STAGE3_REFINE_INPUT = os.path.join(DATA_DIR, "stage3_refine_input.csv")
+STAGE3_REFINE_BASE = os.path.join(DATA_DIR, "stage3_refine_base.csv")
+STAGE3_REFINE_TARGET = os.path.join(DATA_DIR, "stage3_refine_target.csv")
+
+STAGE4_REFINE_INPUT = os.path.join(DATA_DIR, "stage4_refine_input.csv")
+STAGE4_REFINE_BASE = os.path.join(DATA_DIR, "stage4_refine_base.csv")
+STAGE4_REFINE_TARGET = os.path.join(DATA_DIR, "stage4_refine_target.csv")
+
+# Refine model weight files
+MODEL_REFINE_STAGE1 = os.path.join(DATA_DIR, "model_refine_stage1.pth")
+MODEL_REFINE_STAGE2 = os.path.join(DATA_DIR, "model_refine_stage2.pth")
+MODEL_REFINE_STAGE3 = os.path.join(DATA_DIR, "model_refine_stage3.pth")
+MODEL_REFINE_STAGE4 = os.path.join(DATA_DIR, "model_refine_stage4.pth")
+
+# Maps stage -> (input_csv, base_csv, target_csv, model_path)
+STAGE_REFINE_FILES = {
+    1: (STAGE1_REFINE_INPUT, STAGE1_REFINE_BASE, STAGE1_REFINE_TARGET, MODEL_REFINE_STAGE1),
+    2: (STAGE2_REFINE_INPUT, STAGE2_REFINE_BASE, STAGE2_REFINE_TARGET, MODEL_REFINE_STAGE2),
+    3: (STAGE3_REFINE_INPUT, STAGE3_REFINE_BASE, STAGE3_REFINE_TARGET, MODEL_REFINE_STAGE3),
+    4: (STAGE4_REFINE_INPUT, STAGE4_REFINE_BASE, STAGE4_REFINE_TARGET, MODEL_REFINE_STAGE4),
+}
+
+# Refine AI training hyperparameters
+REFINE_MIN_SAMPLES = 30        # Burn-in before full training is enabled
+REFINE_TRAINING_EPOCHS = 400   # Full refine model training
+REFINE_MINI_STEPS = 30         # Mini-retrain steps during Save & Train
+
+# Experimental critic-guided training
+CRITIC_WEIGHT = 0.3            # Weight of critic loss term
+CRITIC_WARMUP_END = 200        # Epochs before critic reaches full weight
+FOCAL_ALPHA = 2.0              # Quadratic scaling for hard-example weighting
+

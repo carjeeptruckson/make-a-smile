@@ -12,8 +12,12 @@ from config import (
     STAGE_NAMES, STAGE_ICONS, STAGE_FILES, STAGE_MIN_SAMPLES,
     STAGE1_Z, STAGE2_Z, STAGE3_Z, STAGE4_Z,
     TRAINING_LR, REJECTION_SAMPLE_COUNT, CONNECTIVITY_WEIGHT,
+    STAGE_REFINE_FILES, REFINE_MIN_SAMPLES, REFINE_MINI_STEPS,
 )
-from model import HeadVAE, ConditionalVAE, staged_loss, score_structural_quality
+from model import (
+    HeadVAE, ConditionalVAE, RefineModel,
+    staged_loss, refine_loss, score_structural_quality,
+)
 
 # Design system colors
 CLR_PRIMARY = "#3B82F6"
@@ -48,7 +52,9 @@ class RefineUI(tk.Frame):
         super().__init__(parent, bg=CLR_BG)
         self.controller = controller
         self.models = {}
+        self.refine_models = {}  # stage -> trained RefineModel
         self.current_face_imgs = {}  # stage -> tensor
+        self.raw_vae_outputs = {}  # stage -> tensor (before RefineModel)
         self.current_stage_fixing = None
         self.can_draw = False
         self.face_count = 0
@@ -216,8 +222,9 @@ class RefineUI(tk.Frame):
     # ── Model loading ───────────────────────────────────────────
 
     def load_model(self):
-        """Load all available stage models."""
+        """Load all available stage models and refine models."""
         self.models = {}
+        self.refine_models = {}
         for stage in range(1, 5):
             _, _, model_path = STAGE_FILES[stage]
             if os.path.exists(model_path):
@@ -229,6 +236,17 @@ class RefineUI(tk.Frame):
                     model.load_state_dict(torch.load(model_path, weights_only=True))
                     model.eval()
                     self.models[stage] = model
+                except Exception:
+                    pass
+
+            # Load RefineModel if available
+            _, _, _, refine_model_path = STAGE_REFINE_FILES[stage]
+            if os.path.exists(refine_model_path):
+                try:
+                    rm = RefineModel()
+                    rm.load_state_dict(torch.load(refine_model_path, weights_only=True))
+                    rm.eval()
+                    self.refine_models[stage] = rm
                 except Exception:
                     pass
 
@@ -257,7 +275,11 @@ class RefineUI(tk.Frame):
     # ── Face generation ─────────────────────────────────────────
 
     def _generate_new_face(self):
-        """Generate a complete face through all trained stages."""
+        """Generate a complete face through all trained stages.
+
+        If a trained RefineModel exists for a stage, it auto-corrects
+        the raw VAE output before display.
+        """
         self.can_draw = False
         self.current_stage_fixing = None
         self._corrected_stages.clear()
@@ -271,6 +293,7 @@ class RefineUI(tk.Frame):
         self._update_counters()
 
         self.current_face_imgs = {}
+        self.raw_vae_outputs = {}
         current_img = None
 
         for stage in sorted(self.models.keys()):
@@ -293,6 +316,27 @@ class RefineUI(tk.Frame):
                     raw = model.decode(z, condition)
                     # Later stages can only ADD pixels, never erase the base
                     current_img = torch.max(raw, condition)
+
+            # Store the raw VAE output BEFORE any refine correction
+            self.raw_vae_outputs[stage] = current_img.clone()
+
+            # Auto-correct with RefineModel if available
+            if stage in self.refine_models:
+                with torch.no_grad():
+                    rm = self.refine_models[stage]
+                    rm.eval()
+                    base_for_refine = (
+                        torch.zeros(1, 256) if stage == 1
+                        else (self.current_face_imgs.get(stage - 1,
+                              torch.zeros(1, 256)) > RENDER_THRESHOLD).float()
+                    )
+                    refined = rm(current_img, base_for_refine)
+                    # Binarize and merge with base (refine can only add/fix,
+                    # not erase base pixels)
+                    refined_bin = (refined > RENDER_THRESHOLD).float()
+                    if stage > 1:
+                        refined_bin = torch.max(refined_bin, base_for_refine)
+                    current_img = refined_bin
 
             self.current_face_imgs[stage] = current_img.clone()
 
@@ -329,13 +373,18 @@ class RefineUI(tk.Frame):
                 self._enter_edit_mode(fix_stage)
 
     def _do_save_and_train(self):
-        """Save all current layers to training data, mini-retrain corrected
-        stages, then move to a new face."""
+        """Save all current layers to training data, save refine training data
+        for corrected stages, mini-retrain corrected VAE stages and their
+        RefineModels, then move to a new face."""
         saved_names = self._save_all_layers()
         self.saved_count += 1
         self._update_counters()
 
         stages_to_train = list(self._corrected_stages) if self._corrected_stages else []
+
+        # Save refine training data for corrected stages
+        self._save_refine_data(stages_to_train)
+
         self._corrected_stages.clear()
 
         if saved_names:
@@ -354,6 +403,7 @@ class RefineUI(tk.Frame):
 
         def do_retrain():
             for stage in stages_to_train:
+                # ── Mini-retrain the VAE ──
                 try:
                     _, model_path = STAGE_FILES[stage][1], STAGE_FILES[stage][2]
                     base_file, target_file, model_path = STAGE_FILES[stage]
@@ -389,7 +439,7 @@ class RefineUI(tk.Frame):
                     n = target_tensor.shape[0]
                     if n == 0:
                         continue
-                    
+
                     batch_size = min(32, n)
                     for step in range(1, REFINE_STEPS + 1):
                         perm = torch.randperm(n)
@@ -397,7 +447,7 @@ class RefineUI(tk.Frame):
                             idx = perm[start:start + batch_size]
                             if len(idx) == 1 and n > 1:
                                 continue
-                                
+
                             bt, bb = target_tensor[idx], base_tensor[idx]
                             optimizer.zero_grad()
                             recon, mu, logvar = (model(bt) if stage == 1
@@ -430,12 +480,117 @@ class RefineUI(tk.Frame):
                     except Exception:
                         pass
 
+                # ── Mini-retrain the RefineModel (if enough data) ──
+                self._mini_retrain_refine(stage)
+
             try:
                 self.after(0, self._after_train_done)
             except Exception:
                 pass
 
         threading.Thread(target=do_retrain, daemon=True).start()
+
+    def _save_refine_data(self, corrected_stages):
+        """Save refine training triplets for corrected stages.
+
+        For each corrected stage, saves:
+        - input: the raw VAE output (before RefineModel)
+        - base: the base/condition layer
+        - target: the user's final corrected pixels
+        """
+        for stage in corrected_stages:
+            if stage not in self.raw_vae_outputs or stage not in self.current_face_imgs:
+                continue
+
+            input_csv, base_csv, target_csv, _ = STAGE_REFINE_FILES[stage]
+
+            # Raw VAE output (what the generator produced)
+            raw = (self.raw_vae_outputs[stage] > RENDER_THRESHOLD).float()
+            raw_flat = [int(v) for v in raw.view(-1).tolist()]
+
+            # Base layer
+            if stage == 1:
+                base_flat = [0] * 256
+            elif (stage - 1) in self.current_face_imgs:
+                base_data = (self.current_face_imgs[stage - 1] > RENDER_THRESHOLD).float()
+                base_flat = [int(v) for v in base_data.view(-1).tolist()]
+            else:
+                base_flat = [0] * 256
+
+            # User's corrected output
+            corrected = (self.current_face_imgs[stage] > RENDER_THRESHOLD).float()
+            target_flat = [int(v) for v in corrected.view(-1).tolist()]
+
+            try:
+                with open(input_csv, "a", newline="") as f:
+                    csv.writer(f).writerow(raw_flat)
+                with open(base_csv, "a", newline="") as f:
+                    csv.writer(f).writerow(base_flat)
+                with open(target_csv, "a", newline="") as f:
+                    csv.writer(f).writerow(target_flat)
+                if DEBUG_LOGGING:
+                    print(f"[Refine] Saved refine data for stage {stage}")
+            except Exception as e:
+                print(f"[Refine] ERROR saving refine data stage {stage}: {e}")
+
+    def _mini_retrain_refine(self, stage):
+        """Mini-retrain the RefineModel for a stage if enough data exists."""
+        input_csv, base_csv, target_csv, model_path = STAGE_REFINE_FILES[stage]
+
+        if not os.path.exists(target_csv):
+            return
+
+        # Load refine training data
+        inputs, bases, targets = [], [], []
+        for path, dest in [(input_csv, inputs), (base_csv, bases), (target_csv, targets)]:
+            if os.path.exists(path):
+                with open(path, "r") as f:
+                    for row in csv.reader(f):
+                        if len(row) == 256:
+                            dest.append([float(v) for v in row])
+
+        if len(targets) < REFINE_MIN_SAMPLES:
+            return  # Not enough data yet
+
+        # Ensure all arrays have same length
+        min_len = min(len(inputs), len(bases), len(targets))
+        if min_len == 0:
+            return
+
+        input_t = torch.tensor(inputs[-min_len:], dtype=torch.float32)
+        base_t = torch.tensor(bases[-min_len:], dtype=torch.float32)
+        target_t = torch.tensor(targets[-min_len:], dtype=torch.float32)
+
+        # Get or create the RefineModel
+        if stage in self.refine_models:
+            rm = self.refine_models[stage]
+        else:
+            rm = RefineModel()
+            if os.path.exists(model_path):
+                rm.load_state_dict(torch.load(model_path, weights_only=True))
+
+        rm.train()
+        optimizer = optim.Adam(rm.parameters(), lr=TRAINING_LR * 0.5)
+        n = input_t.shape[0]
+        batch_size = min(32, n)
+
+        for step in range(REFINE_MINI_STEPS):
+            perm = torch.randperm(n)
+            for start in range(0, n, batch_size):
+                idx = perm[start:start + batch_size]
+                if len(idx) == 1 and n > 1:
+                    continue
+                bi, bb, bt = input_t[idx], base_t[idx], target_t[idx]
+                optimizer.zero_grad()
+                pred = rm(bi, bb)
+                loss = refine_loss(pred, bt)
+                loss.backward()
+                torch.nn.utils.clip_grad_norm_(rm.parameters(), 1.0)
+                optimizer.step()
+
+        rm.eval()
+        torch.save(rm.state_dict(), model_path)
+        self.refine_models[stage] = rm
 
     def _after_train_done(self):
         self.save_train_btn.config(state="normal")
