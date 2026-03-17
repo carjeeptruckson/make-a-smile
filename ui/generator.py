@@ -105,7 +105,7 @@ class GeneratorUI(tk.Frame):
 
         # ── Slider panel ────────────────────────────────────────
         self.slider_panel = tk.Frame(self, bg=CLR_BG, pady=8)
-        self.slider_panel.pack(fill="x", padx=20)
+        self.slider_panel.pack(fill="both", expand=True, padx=20)
 
         tk.Label(
             self.slider_panel, text="Stage Controls",
@@ -113,8 +113,46 @@ class GeneratorUI(tk.Frame):
         ).pack(anchor="w")
         tk.Frame(self.slider_panel, bg=CLR_BORDER, height=1).pack(fill="x", pady=(4, 8))
 
-        self.slider_container = tk.Frame(self.slider_panel, bg=CLR_BG)
-        self.slider_container.pack(fill="x")
+        slider_canvas = tk.Canvas(self.slider_panel, bg=CLR_BG, highlightthickness=0)
+        slider_scrollbar = ttk.Scrollbar(self.slider_panel, orient="vertical", command=slider_canvas.yview)
+        slider_canvas.configure(yscrollcommand=slider_scrollbar.set)
+        
+        slider_scrollbar.pack(side="right", fill="y")
+        slider_canvas.pack(side="left", fill="both", expand=True)
+
+        self.slider_container = tk.Frame(slider_canvas, bg=CLR_BG)
+        slider_window = slider_canvas.create_window((0, 0), window=self.slider_container, anchor="nw")
+
+        def _configure_slider_container(event):
+            slider_canvas.configure(scrollregion=slider_canvas.bbox("all"))
+            
+        def _configure_slider_canvas(event):
+            slider_canvas.itemconfig(slider_window, width=event.width)
+
+        self.slider_container.bind("<Configure>", _configure_slider_container)
+        slider_canvas.bind("<Configure>", _configure_slider_canvas)
+
+        def _on_mousewheel(event):
+            if event.delta:
+                slider_canvas.yview_scroll(int(-1 * np.sign(event.delta)), "units")
+            else:
+                if event.num == 5:
+                    slider_canvas.yview_scroll(1, "units")
+                elif event.num == 4:
+                    slider_canvas.yview_scroll(-1, "units")
+
+        def _bind_mousewheel(event):
+            slider_canvas.bind_all("<MouseWheel>", _on_mousewheel)
+            slider_canvas.bind_all("<Button-4>", _on_mousewheel)
+            slider_canvas.bind_all("<Button-5>", _on_mousewheel)
+
+        def _unbind_mousewheel(event):
+            slider_canvas.unbind_all("<MouseWheel>")
+            slider_canvas.unbind_all("<Button-4>")
+            slider_canvas.unbind_all("<Button-5>")
+
+        self.slider_panel.bind("<Enter>", _bind_mousewheel)
+        self.slider_panel.bind("<Leave>", _unbind_mousewheel)
 
         # ── Bottom controls ─────────────────────────────────────
         btn_frame = tk.Frame(self, bg=CLR_BG, pady=12)

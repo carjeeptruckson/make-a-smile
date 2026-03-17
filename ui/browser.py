@@ -108,9 +108,18 @@ class DataBrowserUI(tk.Frame):
         self.grid_canvas.bind("<Configure>", self._on_canvas_configure)
 
         # Mouse wheel scrolling
-        self.grid_canvas.bind("<MouseWheel>", self._on_mousewheel)
-        self.grid_canvas.bind("<Button-4>", self._on_mousewheel)
-        self.grid_canvas.bind("<Button-5>", self._on_mousewheel)
+        def _bind_mousewheel(event):
+            self.grid_canvas.bind_all("<MouseWheel>", self._on_mousewheel)
+            self.grid_canvas.bind_all("<Button-4>", self._on_mousewheel)
+            self.grid_canvas.bind_all("<Button-5>", self._on_mousewheel)
+
+        def _unbind_mousewheel(event):
+            self.grid_canvas.unbind_all("<MouseWheel>")
+            self.grid_canvas.unbind_all("<Button-4>")
+            self.grid_canvas.unbind_all("<Button-5>")
+
+        grid_container.bind("<Enter>", _bind_mousewheel)
+        grid_container.bind("<Leave>", _unbind_mousewheel)
 
         # ── Bottom action bar ────────────────────────────────────
         action_bar = tk.Frame(self, bg=CLR_BG_LIGHT, pady=10)
@@ -153,13 +162,13 @@ class DataBrowserUI(tk.Frame):
         self.grid_canvas.itemconfig(self._canvas_window, width=event.width)
 
     def _on_mousewheel(self, event):
-        if event.num == 4:
-            self.grid_canvas.yview_scroll(-1, "units")
-        elif event.num == 5:
-            self.grid_canvas.yview_scroll(1, "units")
+        if event.delta:
+            self.grid_canvas.yview_scroll(int(-1 * np.sign(event.delta)), "units")
         else:
-            delta = -1 if event.delta > 0 else 1
-            self.grid_canvas.yview_scroll(delta, "units")
+            if event.num == 5:
+                self.grid_canvas.yview_scroll(1, "units")
+            elif event.num == 4:
+                self.grid_canvas.yview_scroll(-1, "units")
 
     # ── Public API ────────────────────────────────────────────────
 

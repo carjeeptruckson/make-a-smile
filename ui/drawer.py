@@ -133,6 +133,28 @@ class DrawerUI(tk.Frame):
         self.gallery_canvas.pack(side="top", fill="x", expand=True)
         gallery_scrollbar.pack(side="top", fill="x")
 
+        def _on_gallery_mousewheel(event):
+            if event.delta:
+                self.gallery_canvas.xview_scroll(int(-1 * np.sign(event.delta)), "units")
+            else:
+                if event.num == 5:
+                    self.gallery_canvas.xview_scroll(1, "units")
+                elif event.num == 4:
+                    self.gallery_canvas.xview_scroll(-1, "units")
+
+        def _bind_gallery_mousewheel(event):
+            self.gallery_canvas.bind_all("<MouseWheel>", _on_gallery_mousewheel)
+            self.gallery_canvas.bind_all("<Button-4>", _on_gallery_mousewheel)
+            self.gallery_canvas.bind_all("<Button-5>", _on_gallery_mousewheel)
+
+        def _unbind_gallery_mousewheel(event):
+            self.gallery_canvas.unbind_all("<MouseWheel>")
+            self.gallery_canvas.unbind_all("<Button-4>")
+            self.gallery_canvas.unbind_all("<Button-5>")
+
+        gallery_inner.bind("<Enter>", _bind_gallery_mousewheel)
+        gallery_inner.bind("<Leave>", _unbind_gallery_mousewheel)
+
         gallery_btn_frame = tk.Frame(gallery_inner, bg=CLR_BG_LIGHT)
         gallery_btn_frame.pack(side="right", padx=(8, 0))
 
