@@ -54,6 +54,7 @@ class RefineUI(tk.Frame):
         self.models = {}
         self.refine_models = {}  # stage -> trained RefineModel
         self.current_face_imgs = {}  # stage -> tensor
+        self.current_zs = {}         # stage -> tensor (z used to generate)
         self.raw_vae_outputs = {}  # stage -> tensor (before RefineModel)
         self.current_stage_fixing = None
         self.can_draw = False
@@ -308,8 +309,10 @@ class RefineUI(tk.Frame):
                     scores = score_structural_quality(outputs)
                     best_idx = scores.argmin().item()
                     current_img = outputs[best_idx:best_idx + 1]
+                    self.current_zs[stage] = candidates[best_idx:best_idx + 1]
                 else:
                     z = torch.randn(1, z_dim)
+                    self.current_zs[stage] = z
                     if current_img is None:
                         break
                     condition = (current_img > RENDER_THRESHOLD).float()
@@ -789,10 +792,22 @@ class RefineUI(tk.Frame):
                 z_dim = STAGE_Z_DIMS[s]
                 model = self.models[s]
                 with torch.no_grad():
-                    z = torch.randn(1, z_dim)
+                    z = self.current_zs.get(s, torch.randn(1, z_dim))
                     condition = (current_img > RENDER_THRESHOLD).float()
                     raw = model.decode(z, condition)
                     current_img = torch.max(raw, condition)
+
+                    # Store the raw VAE output BEFORE any refine correction
+                    self.raw_vae_outputs[s] = current_img.clone()
+
+                    # Auto-correct with RefineModel if available
+                    if s in self.refine_models:
+                        rm = self.refine_models[s]
+                        rm.eval()
+                        refined = rm(current_img, condition)
+                        refined_bin = (refined > RENDER_THRESHOLD).float()
+                        current_img = torch.max(refined_bin, condition)
+
             self.current_face_imgs[s] = current_img.clone()
 
         # Render the updated composite
