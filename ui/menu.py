@@ -69,9 +69,54 @@ class MainMenu(tk.Frame):
         content.pack(fill="both", expand=True, padx=20, pady=16)
 
         # Left sidebar: Training Progress
-        sidebar = tk.Frame(content, bg=CLR_BG_LIGHT, width=360, padx=16, pady=16)
-        sidebar.pack(side="left", fill="y", padx=(0, 16))
-        sidebar.pack_propagate(False)
+        sidebar_container = tk.Frame(content, bg=CLR_BG_LIGHT, width=420)
+        sidebar_container.pack(side="left", fill="y", padx=(0, 16))
+        sidebar_container.pack_propagate(False)
+
+        sidebar_canvas = tk.Canvas(sidebar_container, bg=CLR_BG_LIGHT, highlightthickness=0)
+        sidebar_scrollbar = ttk.Scrollbar(sidebar_container, orient="vertical", command=sidebar_canvas.yview)
+        
+        sidebar_canvas.configure(yscrollcommand=sidebar_scrollbar.set)
+        sidebar_scrollbar.pack(side="right", fill="y")
+        sidebar_canvas.pack(side="left", fill="both", expand=True)
+
+        sidebar = tk.Frame(sidebar_canvas, bg=CLR_BG_LIGHT, padx=16, pady=16)
+        sidebar_window = sidebar_canvas.create_window((0, 0), window=sidebar, anchor="nw")
+
+        def _configure_sidebar(event):
+            sidebar_canvas.configure(scrollregion=sidebar_canvas.bbox("all"))
+            
+        def _configure_canvas(event):
+            sidebar_canvas.itemconfig(sidebar_window, width=event.width)
+
+        sidebar.bind("<Configure>", _configure_sidebar)
+        sidebar_canvas.bind("<Configure>", _configure_canvas)
+
+        # Mousewheel support for macOS and Windows
+        def _on_mousewheel(event):
+            # macOS scroll delta is usually small, so we don't multiply by -1 if we can avoid it.
+            # but on macOS event.delta is positive for scrolling up. 
+            if event.delta:
+                sidebar_canvas.yview_scroll(int(-1 * np.sign(event.delta)), "units")
+            else:
+                # Linux Button-4/5
+                if event.num == 5:
+                    sidebar_canvas.yview_scroll(1, "units")
+                elif event.num == 4:
+                    sidebar_canvas.yview_scroll(-1, "units")
+
+        def _bind_mousewheel(event):
+            sidebar_canvas.bind_all("<MouseWheel>", _on_mousewheel)
+            sidebar_canvas.bind_all("<Button-4>", _on_mousewheel)
+            sidebar_canvas.bind_all("<Button-5>", _on_mousewheel)
+
+        def _unbind_mousewheel(event):
+            sidebar_canvas.unbind_all("<MouseWheel>")
+            sidebar_canvas.unbind_all("<Button-4>")
+            sidebar_canvas.unbind_all("<Button-5>")
+
+        sidebar_container.bind("<Enter>", _bind_mousewheel)
+        sidebar_container.bind("<Leave>", _unbind_mousewheel)
 
         tk.Label(
             sidebar, text="Training Progress",
