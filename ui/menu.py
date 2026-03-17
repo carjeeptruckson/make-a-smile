@@ -9,18 +9,15 @@ import numpy as np
 from config import (
     GRID_SIZE, DATA_DIR,
     STAGE_NAMES, STAGE_ICONS, STAGE_FILES, STAGE_MIN_SAMPLES,
-    STAGE1_Z, STAGE2_Z, STAGE3_Z, STAGE4_Z,
-    KL_WARMUP_START, KL_WARMUP_END, KL_FINAL_BETA,
     TRAINING_EPOCHS, TRAINING_LR, NOISE_FACTOR, SHARPNESS_WEIGHT,
     CONNECTIVITY_WEIGHT, CONNECTIVITY_WARMUP_START, CONNECTIVITY_WARMUP_END,
-    BOUNDARY_WEIGHT,
+    BOUNDARY_WEIGHT, VQ_COMMITMENT_WEIGHT,
     STAGE_REFINE_FILES, REFINE_MIN_SAMPLES, REFINE_TRAINING_EPOCHS,
     CRITIC_WEIGHT, CRITIC_WARMUP_END, FOCAL_ALPHA,
 )
 from model import (
-    HeadVAE, ConditionalVAE, RefineModel,
-    staged_loss, experimental_staged_loss, refine_loss,
-    kl_beta_schedule, add_noise,
+    HeadConvVQVAE, ConditionalConvVQVAE, RefineModel,
+    vq_staged_loss, refine_loss, add_noise,
 )
 
 # Design system colors
@@ -652,11 +649,11 @@ class MainMenu(tk.Frame):
         )
         loss_label.pack()
 
-        beta_label = tk.Label(
-            modal, text="KL β: 0.000",
+        codebook_label = tk.Label(
+            modal, text="Codebook: —",
             font=("SF Pro", 11), fg=CLR_TEXT_SECONDARY, bg=CLR_BG,
         )
-        beta_label.pack(pady=(4, 16))
+        codebook_label.pack(pady=(4, 16))
 
         progress_var = tk.DoubleVar()
         ttk.Progressbar(
@@ -740,9 +737,9 @@ class MainMenu(tk.Frame):
 
                 # Create model
                 if stage == 1:
-                    model = HeadVAE()
+                    model = HeadConvVQVAE()
                 else:
-                    model = ConditionalVAE(stage_name=f"stage{stage}")
+                    model = ConditionalConvVQVAE(stage_name=f"stage{stage}")
 
                 # Backup existing model
                 if os.path.exists(model_path):
@@ -782,16 +779,12 @@ class MainMenu(tk.Frame):
                         # Denoising augmentation
                         noisy_target = add_noise(batch_target, noise_factor=NOISE_FACTOR)
 
-                        # Forward pass
+                        # Forward pass (VQ-VAE: returns recon, commit_loss, indices, usage)
                         if stage == 1:
-                            recon, mu, logvar = model(noisy_target)
+                            recon, commit_loss, indices, usage = model(noisy_target)
                         else:
-                            recon, mu, logvar = model(noisy_target, batch_base)
+                            recon, commit_loss, indices, usage = model(noisy_target, batch_base)
 
-                        # Loss with KL annealing
-                        beta = kl_beta_schedule(
-                            epoch, KL_WARMUP_START, KL_WARMUP_END, KL_FINAL_BETA,
-                        )
                         npw = 1.0 if stage == 1 else 2.0
                         # Connectivity loss ramps up for stage 1
                         if stage == 1 and epoch > CONNECTIVITY_WARMUP_START:
@@ -800,13 +793,12 @@ class MainMenu(tk.Frame):
                             conn_w = CONNECTIVITY_WEIGHT * conn_progress
                         else:
                             conn_w = 0.0
-                        # Boundary loss for stages 2+: penalize pixels
-                        # adjacent to the base face outline
                         bnd_w = BOUNDARY_WEIGHT if stage > 1 else 0.0
-                        loss = staged_loss(
-                            recon, batch_target, batch_base, mu, logvar, beta,
+                        loss = vq_staged_loss(
+                            recon, batch_target, batch_base, commit_loss,
                             new_pixel_weight=npw,
                             sharpness_weight=SHARPNESS_WEIGHT,
+                            commitment_weight=VQ_COMMITMENT_WEIGHT,
                             connectivity_weight=conn_w,
                             boundary_weight=bnd_w,
                         )
@@ -824,7 +816,7 @@ class MainMenu(tk.Frame):
                     if epoch % 5 == 0 or epoch == 1:
                         avg_loss = epoch_loss / n_batches
                         try:
-                            modal.after(0, lambda e=epoch, l=avg_loss, b=beta: _update_ui(e, l, b))
+                            modal.after(0, lambda e=epoch, l=avg_loss, u=usage: _update_ui(e, l, u))
                         except Exception:
                             break
 
@@ -849,11 +841,11 @@ class MainMenu(tk.Frame):
             finally:
                 self._training = False
 
-        def _update_ui(epoch, loss, beta):
+        def _update_ui(epoch, loss, usage):
             try:
                 epoch_label.config(text=f"Epoch {epoch} / {TRAINING_EPOCHS}")
                 loss_label.config(text=f"Loss: {loss:.4f}")
-                beta_label.config(text=f"KL β: {beta:.3f}")
+                codebook_label.config(text=f"Active codes: {int(usage * 64)}/64")
                 progress_var.set(epoch)
             except Exception:
                 pass
@@ -1204,11 +1196,11 @@ class MainMenu(tk.Frame):
         )
         loss_label.pack()
 
-        beta_label = tk.Label(
-            modal, text="KL β: 0.000  |  Critic ramp: 0%",
+        exp_info_label = tk.Label(
+            modal, text="Codebook: —  |  Critic ramp: 0%",
             font=("SF Pro", 11), fg=CLR_TEXT_SECONDARY, bg=CLR_BG,
         )
-        beta_label.pack(pady=(4, 16))
+        exp_info_label.pack(pady=(4, 16))
 
         progress_var = tk.DoubleVar()
         ttk.Progressbar(
@@ -1278,11 +1270,11 @@ class MainMenu(tk.Frame):
                     base_tensor = (torch.tensor(aug_bases, dtype=torch.float32)
                                    if aug_bases else torch.zeros_like(target_tensor))
 
-                # Create fresh VAE model
+                # Create fresh VQ-VAE model
                 if stage == 1:
-                    model = HeadVAE()
+                    model = HeadConvVQVAE()
                 else:
-                    model = ConditionalVAE(stage_name=f"stage{stage}")
+                    model = ConditionalConvVQVAE(stage_name=f"stage{stage}")
 
                 # Load existing weights as starting point
                 if os.path.exists(model_path):
@@ -1330,14 +1322,10 @@ class MainMenu(tk.Frame):
                         noisy_target = add_noise(batch_target, noise_factor=NOISE_FACTOR)
 
                         if stage == 1:
-                            recon, mu, logvar = model(noisy_target)
+                            recon, commit_loss, indices, usage = model(noisy_target)
                         else:
-                            recon, mu, logvar = model(noisy_target, batch_base)
+                            recon, commit_loss, indices, usage = model(noisy_target, batch_base)
 
-                        # KL annealing (slightly lower beta for experimental to preserve diversity)
-                        beta = kl_beta_schedule(
-                            epoch, KL_WARMUP_START, KL_WARMUP_END, KL_FINAL_BETA * 0.8,
-                        )
                         npw = 1.0 if stage == 1 else 2.0
 
                         if stage == 1 and epoch > CONNECTIVITY_WARMUP_START:
@@ -1349,14 +1337,11 @@ class MainMenu(tk.Frame):
 
                         bnd_w = BOUNDARY_WEIGHT if stage > 1 else 0.0
 
-                        loss = experimental_staged_loss(
-                            recon, batch_target, batch_base, mu, logvar, beta,
-                            refine_model=refine_model,
-                            critic_weight=CRITIC_WEIGHT,
-                            critic_warmup_progress=critic_progress,
-                            focal_alpha=FOCAL_ALPHA,
+                        loss = vq_staged_loss(
+                            recon, batch_target, batch_base, commit_loss,
                             new_pixel_weight=npw,
                             sharpness_weight=SHARPNESS_WEIGHT,
+                            commitment_weight=VQ_COMMITMENT_WEIGHT,
                             connectivity_weight=conn_w,
                             boundary_weight=bnd_w,
                         )
@@ -1373,8 +1358,8 @@ class MainMenu(tk.Frame):
                     if epoch % 5 == 0 or epoch == 1:
                         avg_loss = epoch_loss / max(n_batches, 1)
                         try:
-                            modal.after(0, lambda e=epoch, l=avg_loss, b=beta, cp=critic_progress:
-                                        _update_ui(e, l, b, cp))
+                            modal.after(0, lambda e=epoch, l=avg_loss, u=usage, cp=critic_progress:
+                                        _update_ui(e, l, u, cp))
                         except Exception:
                             break
 
@@ -1400,12 +1385,12 @@ class MainMenu(tk.Frame):
             finally:
                 self._training = False
 
-        def _update_ui(epoch, loss, beta, critic_progress):
+        def _update_ui(epoch, loss, usage, critic_progress):
             try:
                 epoch_label.config(text=f"Epoch {epoch} / {TRAINING_EPOCHS}")
                 loss_label.config(text=f"Loss: {loss:.4f}")
-                beta_label.config(
-                    text=f"KL β: {beta:.3f}  |  Critic ramp: {int(critic_progress * 100)}%")
+                exp_info_label.config(
+                    text=f"Active codes: {int(usage * 64)}/64  |  Critic ramp: {int(critic_progress * 100)}%")
                 progress_var.set(epoch)
             except Exception:
                 pass

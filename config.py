@@ -8,11 +8,12 @@ os.makedirs(DATA_DIR, exist_ok=True)
 GRID_SIZE = 16
 CELL_SIZE = 24
 
-# Per-stage latent dimensions
-STAGE1_Z = 6
-STAGE2_Z = 3
-STAGE3_Z = 3
-STAGE4_Z = 3
+# ── VQ-VAE architecture ─────────────────────────────────────────
+VQ_NUM_EMBEDDINGS = 64   # codebook size (discrete codes to choose from)
+VQ_EMBED_DIM = 16        # embedding dimension per code vector
+VQ_COMMITMENT_WEIGHT = 0.25  # commitment loss weight
+VQ_EMA_DECAY = 0.99      # EMA decay for codebook updates
+VQ_DEAD_CODE_THRESHOLD = 50  # reset unused codes after this many batches
 
 # Stage data files
 STAGE1_DATA = os.path.join(DATA_DIR, "stage1_heads.csv")
@@ -41,10 +42,7 @@ STAGE_MIN_SAMPLES = {
 }
 
 # Training hyperparameters
-KL_WARMUP_START = 300
-KL_WARMUP_END = 700
-KL_FINAL_BETA = 0.1
-TRAINING_EPOCHS = 800
+TRAINING_EPOCHS = 400
 TRAINING_LR = 5e-4
 NOISE_FACTOR = 0.03
 SHARPNESS_WEIGHT = 0.15
@@ -62,8 +60,6 @@ CONNECTIVITY_WARMUP_END = 300
 REJECTION_SAMPLE_COUNT = 8
 
 # Rendering: threshold for binarizing sigmoid outputs
-# With sharpening loss, the model produces crisp 0-or-1 outputs,
-# so 0.5 works well. Only raise this if outputs are still soft.
 RENDER_THRESHOLD = 0.5
 
 # Stage metadata (for UI labels)
@@ -132,4 +128,3 @@ REFINE_MINI_STEPS = 30         # Mini-retrain steps during Save & Train
 CRITIC_WEIGHT = 0.3            # Weight of critic loss term
 CRITIC_WARMUP_END = 200        # Epochs before critic reaches full weight
 FOCAL_ALPHA = 2.0              # Quadratic scaling for hard-example weighting
-

@@ -10,13 +10,13 @@ import numpy as np
 from config import (
     GRID_SIZE, CELL_SIZE, RENDER_THRESHOLD,
     STAGE_NAMES, STAGE_ICONS, STAGE_FILES, STAGE_MIN_SAMPLES,
-    STAGE1_Z, STAGE2_Z, STAGE3_Z, STAGE4_Z,
     TRAINING_LR, REJECTION_SAMPLE_COUNT, CONNECTIVITY_WEIGHT,
     STAGE_REFINE_FILES, REFINE_MIN_SAMPLES, REFINE_MINI_STEPS,
+    VQ_NUM_EMBEDDINGS, VQ_COMMITMENT_WEIGHT,
 )
 from model import (
-    HeadVAE, ConditionalVAE, RefineModel,
-    staged_loss, refine_loss, score_structural_quality,
+    HeadConvVQVAE, ConditionalConvVQVAE, RefineModel,
+    vq_staged_loss, refine_loss, score_structural_quality,
 )
 
 # Design system colors
@@ -33,8 +33,6 @@ CLR_BG_LIGHT = "#F9FAFB"
 CLR_BG_HOVER = "#F3F4F6"
 CLR_BASE_PIXEL = "#BFDBFE"
 CLR_DRAW_PIXEL = "#1F2937"
-
-STAGE_Z_DIMS = {1: STAGE1_Z, 2: STAGE2_Z, 3: STAGE3_Z, 4: STAGE4_Z}
 
 # Set to True to print per-stage save logs to the terminal
 DEBUG_LOGGING = False
@@ -54,7 +52,7 @@ class RefineUI(tk.Frame):
         self.models = {}
         self.refine_models = {}  # stage -> trained RefineModel
         self.current_face_imgs = {}  # stage -> tensor
-        self.current_zs = {}         # stage -> tensor (z used to generate)
+        self.current_seeds = {}      # stage -> int (seed used to generate)
         self.raw_vae_outputs = {}  # stage -> tensor (before RefineModel)
         self.current_stage_fixing = None
         self.can_draw = False
@@ -231,9 +229,9 @@ class RefineUI(tk.Frame):
             if os.path.exists(model_path):
                 try:
                     if stage == 1:
-                        model = HeadVAE()
+                        model = HeadConvVQVAE()
                     else:
-                        model = ConditionalVAE(stage_name=f"stage{stage}")
+                        model = ConditionalConvVQVAE(stage_name=f"stage{stage}")
                     model.load_state_dict(torch.load(model_path, weights_only=True))
                     model.eval()
                     self.models[stage] = model
@@ -297,27 +295,35 @@ class RefineUI(tk.Frame):
         self.raw_vae_outputs = {}
         current_img = None
 
+        def _seed_to_indices(seed):
+            rng = torch.Generator().manual_seed(seed)
+            return torch.randint(0, VQ_NUM_EMBEDDINGS, (1, 4, 4), generator=rng)
+
         for stage in sorted(self.models.keys()):
-            z_dim = STAGE_Z_DIMS[stage]
             model = self.models[stage]
 
             with torch.no_grad():
                 if stage == 1:
-                    # Rejection sampling: pick best of N candidates
-                    candidates = torch.randn(REJECTION_SAMPLE_COUNT, z_dim) * 1.5
-                    outputs = model.decode(candidates)
+                    # Rejection sampling: pick best of N candidate seeds
+                    seeds = [random.randint(0, 999999) for _ in range(REJECTION_SAMPLE_COUNT)]
+                    outputs = []
+                    for s in seeds:
+                        indices = _seed_to_indices(s)
+                        out = model.decode(indices=indices)
+                        outputs.append(out)
+                    outputs = torch.cat(outputs, dim=0)
                     scores = score_structural_quality(outputs)
                     best_idx = scores.argmin().item()
                     current_img = outputs[best_idx:best_idx + 1]
-                    self.current_zs[stage] = candidates[best_idx:best_idx + 1]
+                    self.current_seeds[stage] = seeds[best_idx]
                 else:
-                    z = torch.randn(1, z_dim)
-                    self.current_zs[stage] = z
+                    seed = random.randint(0, 999999)
+                    self.current_seeds[stage] = seed
                     if current_img is None:
                         break
                     condition = (current_img > RENDER_THRESHOLD).float()
-                    raw = model.decode(z, condition)
-                    # Later stages can only ADD pixels, never erase the base
+                    indices = _seed_to_indices(seed)
+                    raw = model.decode(indices=indices, condition=condition)
                     current_img = torch.max(raw, condition)
 
             # Store the raw VAE output BEFORE any refine correction
@@ -453,11 +459,12 @@ class RefineUI(tk.Frame):
 
                             bt, bb = target_tensor[idx], base_tensor[idx]
                             optimizer.zero_grad()
-                            recon, mu, logvar = (model(bt) if stage == 1
-                                                 else model(bt, bb))
+                            recon, commit_loss, _, _ = (model(bt) if stage == 1
+                                                        else model(bt, bb))
                             conn_w = CONNECTIVITY_WEIGHT * 0.5 if stage == 1 else 0.0
-                            loss = staged_loss(recon, bt, bb, mu, logvar,
-                                               beta=0.3, connectivity_weight=conn_w)
+                            loss = vq_staged_loss(recon, bt, bb, commit_loss,
+                                                  commitment_weight=VQ_COMMITMENT_WEIGHT,
+                                                  connectivity_weight=conn_w)
                             loss.backward()
                             torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
                             optimizer.step()
@@ -789,12 +796,13 @@ class RefineUI(tk.Frame):
                 combined = torch.max(new_base, drawn).unsqueeze(0)
                 current_img = combined
             else:
-                z_dim = STAGE_Z_DIMS[s]
                 model = self.models[s]
                 with torch.no_grad():
-                    z = self.current_zs.get(s, torch.randn(1, z_dim))
+                    seed = self.current_seeds.get(s, random.randint(0, 999999))
+                    rng = torch.Generator().manual_seed(seed)
+                    indices = torch.randint(0, VQ_NUM_EMBEDDINGS, (1, 4, 4), generator=rng)
                     condition = (current_img > RENDER_THRESHOLD).float()
-                    raw = model.decode(z, condition)
+                    raw = model.decode(indices=indices, condition=condition)
                     current_img = torch.max(raw, condition)
 
                     # Store the raw VAE output BEFORE any refine correction
@@ -836,27 +844,35 @@ class RefineUI(tk.Frame):
                 break
 
         # Regenerate from from_stage onward
+        def _seed_to_indices(seed):
+            rng = torch.Generator().manual_seed(seed)
+            return torch.randint(0, VQ_NUM_EMBEDDINGS, (1, 4, 4), generator=rng)
+
         for stage in sorted(self.models.keys()):
             if stage < from_stage:
                 continue
 
-            z_dim = STAGE_Z_DIMS[stage]
             model = self.models[stage]
 
             with torch.no_grad():
                 if stage == 1:
-                    candidates = torch.randn(REJECTION_SAMPLE_COUNT, z_dim) * 1.5
-                    outputs = model.decode(candidates)
+                    seeds = [random.randint(0, 999999) for _ in range(REJECTION_SAMPLE_COUNT)]
+                    outputs = []
+                    for s in seeds:
+                        indices = _seed_to_indices(s)
+                        out = model.decode(indices=indices)
+                        outputs.append(out)
+                    outputs = torch.cat(outputs, dim=0)
                     scores = score_structural_quality(outputs)
                     best_idx = scores.argmin().item()
                     current_img = outputs[best_idx:best_idx + 1]
                 else:
-                    z = torch.randn(1, z_dim)
+                    seed = random.randint(0, 999999)
                     if current_img is None:
                         break
                     condition = (current_img > RENDER_THRESHOLD).float()
-                    raw = model.decode(z, condition)
-                    # Later stages can only ADD pixels, never erase the base
+                    indices = _seed_to_indices(seed)
+                    raw = model.decode(indices=indices, condition=condition)
                     current_img = torch.max(raw, condition)
 
             self.current_face_imgs[stage] = current_img.clone()

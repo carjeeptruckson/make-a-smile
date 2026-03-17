@@ -9,14 +9,14 @@ import numpy as np
 import os
 from config import (
     GRID_SIZE, CELL_SIZE, RENDER_THRESHOLD,
-    STAGE1_Z, STAGE2_Z, STAGE3_Z, STAGE4_Z,
     STAGE_NAMES, STAGE_ICONS, STAGE_FILES,
     REJECTION_SAMPLE_COUNT, TRAINING_LR,
     CONNECTIVITY_WEIGHT, SHARPNESS_WEIGHT,
+    VQ_NUM_EMBEDDINGS, VQ_COMMITMENT_WEIGHT,
 )
 from model import (
-    HeadVAE, ConditionalVAE, score_structural_quality,
-    flood_fill_gap_score, staged_loss,
+    HeadConvVQVAE, ConditionalConvVQVAE, score_structural_quality,
+    flood_fill_gap_score, vq_staged_loss,
 )
 
 # Design system colors
@@ -30,23 +30,26 @@ CLR_BG_LIGHT = "#F9FAFB"
 CLR_BG_HOVER = "#F3F4F6"
 CLR_DRAW_PIXEL = "#1F2937"
 
-# Per-stage z dimensions
-STAGE_Z_DIMS = {1: STAGE1_Z, 2: STAGE2_Z, 3: STAGE3_Z, 4: STAGE4_Z}
-
 # Display scaling
 DISPLAY_SIZE = 480
 PIXEL_SIZE = DISPLAY_SIZE // GRID_SIZE
 
 
+def _seed_to_indices(seed):
+    """Convert an integer seed to a (1, 4, 4) tensor of codebook indices."""
+    rng = torch.Generator().manual_seed(seed)
+    return torch.randint(0, VQ_NUM_EMBEDDINGS, (1, 4, 4), generator=rng)
+
+
 class GeneratorUI(tk.Frame):
-    """Face assembly studio with per-stage slider controls."""
+    """Face assembly studio with per-stage variation controls."""
 
     def __init__(self, parent, controller):
         super().__init__(parent, bg=CLR_BG)
         self.controller = controller
-        self.models = {}  # stage_num -> loaded model
-        self.stage_z = {}  # stage_num -> list of z values
-        self.slider_widgets = {}  # stage_num -> list of (slider, value_label)
+        self.models = {}           # stage_num -> loaded model
+        self.stage_seeds = {}      # stage_num -> current seed value
+        self.slider_widgets = {}   # stage_num -> (slider, value_label)
         self._debounce_id = None
         self._generating = False
         self._training = False
@@ -116,7 +119,7 @@ class GeneratorUI(tk.Frame):
         slider_canvas = tk.Canvas(self.slider_panel, bg=CLR_BG, highlightthickness=0)
         slider_scrollbar = ttk.Scrollbar(self.slider_panel, orient="vertical", command=slider_canvas.yview)
         slider_canvas.configure(yscrollcommand=slider_scrollbar.set)
-        
+
         slider_scrollbar.pack(side="right", fill="y")
         slider_canvas.pack(side="left", fill="both", expand=True)
 
@@ -125,7 +128,7 @@ class GeneratorUI(tk.Frame):
 
         def _configure_slider_container(event):
             slider_canvas.configure(scrollregion=slider_canvas.bbox("all"))
-            
+
         def _configure_slider_canvas(event):
             slider_canvas.itemconfig(slider_window, width=event.width)
 
@@ -178,14 +181,6 @@ class GeneratorUI(tk.Frame):
         self.fix_btn.pack(side="left", padx=8)
 
         tk.Button(
-            btn_frame, text="✨ Morph", font=("SF Pro", 12),
-            fg=CLR_TEXT, bg=CLR_BG, relief="solid", bd=1,
-            padx=16, pady=6, cursor="hand2",
-            highlightbackground=CLR_BORDER,
-            command=self._morph_animation,
-        ).pack(side="left", padx=8)
-
-        tk.Button(
             btn_frame, text="← Main Menu", font=("SF Pro", 12),
             fg=CLR_TEXT, bg=CLR_BG, relief="solid", bd=1,
             padx=16, pady=6, cursor="hand2",
@@ -210,9 +205,9 @@ class GeneratorUI(tk.Frame):
             if os.path.exists(model_path):
                 try:
                     if stage == 1:
-                        model = HeadVAE()
+                        model = HeadConvVQVAE()
                     else:
-                        model = ConditionalVAE(stage_name=f"stage{stage}")
+                        model = ConditionalConvVQVAE(stage_name=f"stage{stage}")
                     model.load_state_dict(torch.load(model_path, weights_only=True))
                     model.eval()
                     self.models[stage] = model
@@ -228,14 +223,13 @@ class GeneratorUI(tk.Frame):
             self.empty_label.pack(pady=8)
 
     def _rebuild_sliders(self):
-        """Rebuild the slider rows for all trained stages."""
+        """Rebuild variation sliders — one per trained stage."""
         for child in self.slider_container.winfo_children():
             child.destroy()
         self.slider_widgets = {}
-        self.stage_z = {}
+        self.stage_seeds = {}
 
         for stage in sorted(self.models.keys()):
-            z_dim = STAGE_Z_DIMS[stage]
             name = STAGE_NAMES.get(stage, f"Stage {stage}")
             icon = STAGE_ICONS.get(stage, "")
 
@@ -254,35 +248,28 @@ class GeneratorUI(tk.Frame):
                 width=10, anchor="w",
             ).pack(side="left", padx=(0, 12))
 
-            # Sliders
-            sliders = []
-            slider_frame = tk.Frame(row, bg=CLR_BG)
-            slider_frame.pack(side="left", fill="x", expand=True)
+            # Single variation slider per stage
+            s_frame = tk.Frame(row, bg=CLR_BG)
+            s_frame.pack(side="left", fill="x", expand=True)
 
-            for i in range(z_dim):
-                s_frame = tk.Frame(slider_frame, bg=CLR_BG)
-                s_frame.pack(side="left", padx=8)
+            tk.Label(
+                s_frame, text="Variation",
+                font=("SF Pro", 10), fg=CLR_TEXT_SECONDARY, bg=CLR_BG,
+            ).pack()
 
-                tk.Label(
-                    s_frame, text=f"z{i+1}",
-                    font=("SF Pro", 10), fg=CLR_TEXT_SECONDARY, bg=CLR_BG,
-                ).pack()
+            slider = ttk.Scale(
+                s_frame, from_=0, to=999,
+                orient=tk.HORIZONTAL, length=300,
+                command=lambda val, s=stage: self._on_slider_change(s),
+            )
+            slider.set(random.randint(0, 999))
+            slider.pack()
 
-                slider = ttk.Scale(
-                    s_frame, from_=-3.0, to=3.0,
-                    orient=tk.HORIZONTAL, length=120,
-                    command=lambda val, s=stage: self._on_slider_change(s),
-                )
-                slider.set(0.0)
-                slider.pack()
-
-                val_label = tk.Label(
-                    s_frame, text="0.00",
-                    font=("Courier", 10), fg=CLR_TEXT_SECONDARY, bg=CLR_BG,
-                )
-                val_label.pack()
-
-                sliders.append((slider, val_label))
+            val_label = tk.Label(
+                s_frame, text="0",
+                font=("Courier", 10), fg=CLR_TEXT_SECONDARY, bg=CLR_BG,
+            )
+            val_label.pack()
 
             # Refresh button
             tk.Button(
@@ -292,40 +279,40 @@ class GeneratorUI(tk.Frame):
                 command=lambda s=stage: self._randomize_stage(s),
             ).pack(side="right", padx=(8, 0))
 
-            self.slider_widgets[stage] = sliders
-            self.stage_z[stage] = [0.0] * z_dim
+            self.slider_widgets[stage] = (slider, val_label)
+            self.stage_seeds[stage] = int(slider.get())
 
     # ── Slider handling ─────────────────────────────────────────
 
     def _on_slider_change(self, changed_stage):
         """Debounced handler for slider changes."""
         # Update value labels immediately
-        for stage, sliders in self.slider_widgets.items():
-            for slider, label in sliders:
-                val = slider.get()
-                label.config(text=f"{val:.2f}")
+        for stage, (slider, label) in self.slider_widgets.items():
+            val = int(slider.get())
+            label.config(text=str(val))
+            self.stage_seeds[stage] = val
 
         # Debounce generation
         if self._debounce_id:
             self.after_cancel(self._debounce_id)
-        self._debounce_id = self.after(100, self._generate_face)
+        self._debounce_id = self.after(100, lambda: self._generate_from(changed_stage))
 
     def _randomize_stage(self, stage):
-        """Randomize sliders for one stage and regenerate from that stage only."""
+        """Randomize seed for one stage and regenerate from that stage."""
         if stage not in self.slider_widgets:
             return
         if stage == 1 and stage in self.models:
             self._randomize_with_rejection(stage)
         else:
-            for slider, label in self.slider_widgets[stage]:
-                val = random.uniform(-2.0, 2.0)
-                slider.set(val)
-                label.config(text=f"{val:.2f}")
-        # Regenerate from this stage only — lower layers are unchanged
+            seed = random.randint(0, 999)
+            slider, label = self.slider_widgets[stage]
+            slider.set(seed)
+            label.config(text=str(seed))
+            self.stage_seeds[stage] = seed
         self._generate_from(stage)
 
     def _randomize_all(self):
-        """Randomize all stage sliders and regenerate."""
+        """Randomize all stages and regenerate."""
         # Rejection-sample stage 1 first
         if 1 in self.slider_widgets and 1 in self.models:
             self._randomize_with_rejection(1)
@@ -333,29 +320,37 @@ class GeneratorUI(tk.Frame):
         for stage in self.slider_widgets:
             if stage == 1:
                 continue
-            for slider, label in self.slider_widgets[stage]:
-                val = random.uniform(-2.0, 2.0)
-                slider.set(val)
-                label.config(text=f"{val:.2f}")
+            seed = random.randint(0, 999)
+            slider, label = self.slider_widgets[stage]
+            slider.set(seed)
+            label.config(text=str(seed))
+            self.stage_seeds[stage] = seed
         self._generate_face()
 
     def _randomize_with_rejection(self, stage):
-        """Generate N candidate z vectors and pick the structurally best one."""
+        """Generate N candidate seeds and pick the structurally best one."""
         model = self.models[stage]
-        z_dim = STAGE_Z_DIMS[stage]
         n = REJECTION_SAMPLE_COUNT
 
         with torch.no_grad():
-            candidates = torch.randn(n, z_dim) * 1.5
-            outputs = model.decode(candidates)
+            # Generate N random seeds and decode each
+            seeds = [random.randint(0, 999999) for _ in range(n)]
+            outputs = []
+            for s in seeds:
+                indices = _seed_to_indices(s)
+                out = model.decode(indices=indices)
+                outputs.append(out)
+            outputs = torch.cat(outputs, dim=0)  # (N, 1, 16, 16)
             scores = score_structural_quality(outputs)
             best_idx = scores.argmin().item()
-            best_z = candidates[best_idx]
+            best_seed = seeds[best_idx]
 
-        for i, (slider, label) in enumerate(self.slider_widgets[stage]):
-            val = best_z[i].item()
-            slider.set(val)
-            label.config(text=f"{val:.2f}")
+        slider, label = self.slider_widgets[stage]
+        # Map the actual seed into slider range for display
+        display_val = best_seed % 1000
+        slider.set(display_val)
+        label.config(text=str(display_val))
+        self.stage_seeds[stage] = best_seed
 
     # ── Generation pipeline ─────────────────────────────────────
 
@@ -367,7 +362,6 @@ class GeneratorUI(tk.Frame):
 
         def do_generate():
             try:
-                # Seed current_img from the cached output just below from_stage
                 current_img = None
                 for s in sorted(self.models.keys()):
                     if s < from_stage:
@@ -381,18 +375,18 @@ class GeneratorUI(tk.Frame):
                 for stage in sorted(self.models.keys()):
                     if stage < from_stage:
                         continue
-                    z_values = [s.get() for s, _ in self.slider_widgets[stage]]
-                    z_tensor = torch.tensor([z_values], dtype=torch.float32)
+                    seed = self.stage_seeds.get(stage, 0)
+                    indices = _seed_to_indices(seed)
                     model = self.models[stage]
 
                     with torch.no_grad():
                         if stage == 1:
-                            current_img = model.decode(z_tensor)
+                            current_img = model.decode(indices=indices)
                         else:
                             if current_img is None:
                                 break
                             condition = (current_img > RENDER_THRESHOLD).float()
-                            raw = model.decode(z_tensor, condition)
+                            raw = model.decode(indices=indices, condition=condition)
                             current_img = torch.max(raw, condition)
 
                     stage_imgs[stage] = current_img.clone()
@@ -411,7 +405,7 @@ class GeneratorUI(tk.Frame):
         threading.Thread(target=do_generate, daemon=True).start()
 
     def _generate_face(self):
-        """Run the staged generation pipeline."""
+        """Run the full staged generation pipeline."""
         if self._generating or not self.models:
             return
 
@@ -423,22 +417,18 @@ class GeneratorUI(tk.Frame):
                 stage_imgs = {}
 
                 for stage in sorted(self.models.keys()):
-                    # Get z values from sliders
-                    z_values = [s.get() for s, _ in self.slider_widgets[stage]]
-                    z_tensor = torch.tensor([z_values], dtype=torch.float32)
-
+                    seed = self.stage_seeds.get(stage, 0)
+                    indices = _seed_to_indices(seed)
                     model = self.models[stage]
 
                     with torch.no_grad():
                         if stage == 1:
-                            current_img = model.decode(z_tensor)
+                            current_img = model.decode(indices=indices)
                         else:
                             if current_img is None:
                                 break
-                            # Binarize the condition for cleaner conditioning
                             condition = (current_img > RENDER_THRESHOLD).float()
-                            raw = model.decode(z_tensor, condition)
-                            # Later stages can only ADD pixels, never erase the base
+                            raw = model.decode(indices=indices, condition=condition)
                             current_img = torch.max(raw, condition)
 
                     stage_imgs[stage] = current_img.clone()
@@ -458,42 +448,11 @@ class GeneratorUI(tk.Frame):
         thread.start()
 
     def _render_face(self, img_array):
-        """Render a 16×16 numpy array to the canvas."""
+        """Render a 16x16 numpy array to the canvas."""
         for y in range(GRID_SIZE):
             for x in range(GRID_SIZE):
                 color = CLR_DRAW_PIXEL if img_array[y][x] > RENDER_THRESHOLD else CLR_BG
                 self.canvas.itemconfig(self.rects[y][x], fill=color)
-
-    # ── Morph animation ─────────────────────────────────────────
-
-    def _morph_animation(self):
-        """Animate morphing from current face to a random target."""
-        if not self.models:
-            return
-
-        # Capture start z values
-        start_z = {}
-        target_z = {}
-        for stage in self.slider_widgets:
-            start_z[stage] = [s.get() for s, _ in self.slider_widgets[stage]]
-            target_z[stage] = [random.uniform(-2.0, 2.0) for _ in self.slider_widgets[stage]]
-
-        steps = 15
-
-        def step_morph(current_step):
-            alpha = current_step / float(steps)
-            for stage in self.slider_widgets:
-                for i, (slider, label) in enumerate(self.slider_widgets[stage]):
-                    new_val = start_z[stage][i] * (1 - alpha) + target_z[stage][i] * alpha
-                    slider.set(new_val)
-                    label.config(text=f"{new_val:.2f}")
-
-            self._generate_face()
-
-            if current_step < steps:
-                self.after(60, lambda: step_morph(current_step + 1))
-
-        step_morph(0)
 
     # ── Auto gap-fix and train ───────────────────────────────────
 
@@ -555,24 +514,18 @@ class GeneratorUI(tk.Frame):
                         border_dist[ny,nx] = border_dist[y,x] + 1
                         queue.append((ny, nx))
 
-            # The gap narrows where center_dist + border_dist is minimized.
-            # Find empty pixels on the leak path (reachable from both center
-            # and border) that are adjacent to outline pixels.
             best = None
             best_score = float('inf')
             for y in range(1, gs-1):
                 for x in range(1, gs-1):
                     if filled[y, x] or center_dist[y, x] < 0 or border_dist[y, x] < 0:
                         continue
-                    # Must be adjacent to at least 1 outline pixel
                     adj = sum(
                         1 for dy, dx in [(-1,0),(1,0),(0,-1),(0,1)]
                         if filled[y+dy, x+dx]
                     )
                     if adj < 1:
                         continue
-                    # Score: total path length through this pixel (lower = narrower gap)
-                    # Break ties by preferring more outline neighbors
                     path_len = center_dist[y, x] + border_dist[y, x]
                     score = (path_len, -adj)
                     if best is None or score < best_score:
@@ -625,14 +578,12 @@ class GeneratorUI(tk.Frame):
 
         # Show the fixed version immediately
         self._current_stage_imgs[1] = torch.tensor(
-            fixed_np.reshape(1, -1), dtype=torch.float32,
+            fixed_np.reshape(1, 1, GRID_SIZE, GRID_SIZE), dtype=torch.float32,
         )
-        # Re-render with the fixed image visible at stage 1
         final_stage = max(self._current_stage_imgs.keys())
         if final_stage == 1:
             self._render_face(fixed_np.astype(float))
         else:
-            # Regenerate stages 2+ with the fixed base
             self._generate_face()
 
         self.status_label.config(text="Gap fixed! Training...", fg="#10B981")
@@ -672,10 +623,11 @@ class GeneratorUI(tk.Frame):
                         batch_b = base_tensor[idx]
 
                         optimizer.zero_grad()
-                        recon, mu, logvar = model(batch_t)
-                        loss = staged_loss(
-                            recon, batch_t, batch_b, mu, logvar, beta=0.1,
+                        recon, commit_loss, _, _ = model(batch_t)
+                        loss = vq_staged_loss(
+                            recon, batch_t, batch_b, commit_loss,
                             sharpness_weight=SHARPNESS_WEIGHT,
+                            commitment_weight=VQ_COMMITMENT_WEIGHT,
                             connectivity_weight=CONNECTIVITY_WEIGHT,
                         )
                         loss.backward()
