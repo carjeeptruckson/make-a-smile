@@ -381,12 +381,23 @@ class RefineUI(tk.Frame):
                                    else torch.tensor(all_bases, dtype=torch.float32)
                                    if all_bases else torch.zeros_like(target_tensor))
 
+                    if stage > 1:
+                        min_len = min(target_tensor.shape[0], base_tensor.shape[0])
+                        target_tensor = target_tensor[-min_len:]
+                        base_tensor = base_tensor[-min_len:]
+
                     n = target_tensor.shape[0]
+                    if n == 0:
+                        continue
+                    
                     batch_size = min(32, n)
                     for step in range(1, REFINE_STEPS + 1):
                         perm = torch.randperm(n)
                         for start in range(0, n, batch_size):
                             idx = perm[start:start + batch_size]
+                            if len(idx) == 1 and n > 1:
+                                continue
+                                
                             bt, bb = target_tensor[idx], base_tensor[idx]
                             optimizer.zero_grad()
                             recon, mu, logvar = (model(bt) if stage == 1
@@ -410,6 +421,9 @@ class RefineUI(tk.Frame):
                     torch.save(model.state_dict(), model_path)
 
                 except Exception as e:
+                    import traceback
+                    print(f"ERROR in train stage {stage}:", flush=True)
+                    traceback.print_exc()
                     try:
                         self.after(0, lambda err=e: self._show_notification(
                             f"⚠ Train error: {err}", CLR_DANGER))
