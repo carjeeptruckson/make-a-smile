@@ -9,10 +9,10 @@ GRID_SIZE = 16
 CELL_SIZE = 24
 
 # Per-stage latent dimensions
-STAGE1_Z = 6
-STAGE2_Z = 3
-STAGE3_Z = 3
-STAGE4_Z = 3
+STAGE1_Z = 8
+STAGE2_Z = 4
+STAGE3_Z = 4
+STAGE4_Z = 4
 
 # Stage data files
 STAGE1_DATA = os.path.join(DATA_DIR, "stage1_heads.csv")
@@ -41,11 +41,11 @@ STAGE_MIN_SAMPLES = {
 }
 
 # Training hyperparameters
-KL_WARMUP_START = 300
-KL_WARMUP_END = 700
-KL_FINAL_BETA = 0.1
-TRAINING_EPOCHS = 800
-TRAINING_LR = 5e-4
+KL_WARMUP_START = 100
+KL_WARMUP_END = 400
+KL_FINAL_BETA = 0.3
+TRAINING_EPOCHS = 600
+TRAINING_LR = 3e-4
 NOISE_FACTOR = 0.03
 SHARPNESS_WEIGHT = 0.15
 
@@ -62,8 +62,6 @@ CONNECTIVITY_WARMUP_END = 300
 REJECTION_SAMPLE_COUNT = 8
 
 # Rendering: threshold for binarizing sigmoid outputs
-# With sharpening loss, the model produces crisp 0-or-1 outputs,
-# so 0.5 works well. Only raise this if outputs are still soft.
 RENDER_THRESHOLD = 0.5
 
 # Stage metadata (for UI labels)
@@ -89,6 +87,12 @@ STAGE_FILES = {
     3: (STAGE3_BASE_DATA, STAGE3_TARGET_DATA, MODEL_STAGE3),
     4: (STAGE4_BASE_DATA, STAGE4_TARGET_DATA, MODEL_STAGE4),
 }
+
+# ── Augmentation ──────────────────────────────────────────────
+# Translation offsets: shift images by these amounts (in pixels)
+AUGMENT_TRANSLATE_OFFSETS = [(-1, 0), (1, 0), (0, -1), (0, 1)]
+# Eyes (stage 2) get symmetry enforcement during augmentation
+AUGMENT_SYMMETRY_STAGES = {2}
 
 # ── Refine AI ────────────────────────────────────────────────────
 
@@ -132,4 +136,3 @@ REFINE_MINI_STEPS = 30         # Mini-retrain steps during Save & Train
 CRITIC_WEIGHT = 0.3            # Weight of critic loss term
 CRITIC_WARMUP_END = 200        # Epochs before critic reaches full weight
 FOCAL_ALPHA = 2.0              # Quadratic scaling for hard-example weighting
-

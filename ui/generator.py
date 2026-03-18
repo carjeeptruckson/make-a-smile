@@ -60,7 +60,7 @@ class GeneratorUI(tk.Frame):
         header.pack(fill="x")
 
         tk.Button(
-            header, text="← Menu", font=("SF Pro", 11),
+            header, text="<- Menu", font=("SF Pro", 11),
             fg=CLR_TEXT, bg=CLR_BG_LIGHT, relief="flat",
             padx=12, pady=4, cursor="hand2",
             command=self.controller.show_menu,
@@ -116,7 +116,7 @@ class GeneratorUI(tk.Frame):
         slider_canvas = tk.Canvas(self.slider_panel, bg=CLR_BG, highlightthickness=0)
         slider_scrollbar = ttk.Scrollbar(self.slider_panel, orient="vertical", command=slider_canvas.yview)
         slider_canvas.configure(yscrollcommand=slider_scrollbar.set)
-        
+
         slider_scrollbar.pack(side="right", fill="y")
         slider_canvas.pack(side="left", fill="both", expand=True)
 
@@ -125,7 +125,7 @@ class GeneratorUI(tk.Frame):
 
         def _configure_slider_container(event):
             slider_canvas.configure(scrollregion=slider_canvas.bbox("all"))
-            
+
         def _configure_slider_canvas(event):
             slider_canvas.itemconfig(slider_window, width=event.width)
 
@@ -159,7 +159,7 @@ class GeneratorUI(tk.Frame):
         btn_frame.pack()
 
         tk.Button(
-            btn_frame, text="🎲 Surprise Me", font=("SF Pro", 12, "bold"),
+            btn_frame, text="Surprise Me", font=("SF Pro", 12, "bold"),
             fg=CLR_BG, bg=CLR_PRIMARY, activebackground=CLR_PRIMARY_HOVER,
             activeforeground=CLR_BG,
             relief="solid", bd=1, padx=16, pady=8, cursor="hand2",
@@ -168,7 +168,7 @@ class GeneratorUI(tk.Frame):
         ).pack(side="left", padx=8)
 
         self.fix_btn = tk.Button(
-            btn_frame, text="🔧 Fix Gaps & Train", font=("SF Pro", 12, "bold"),
+            btn_frame, text="Fix Gaps & Train", font=("SF Pro", 12, "bold"),
             fg=CLR_BG, bg="#10B981", activebackground="#059669",
             activeforeground=CLR_BG,
             relief="solid", bd=1, padx=16, pady=8, cursor="hand2",
@@ -178,7 +178,7 @@ class GeneratorUI(tk.Frame):
         self.fix_btn.pack(side="left", padx=8)
 
         tk.Button(
-            btn_frame, text="✨ Morph", font=("SF Pro", 12),
+            btn_frame, text="Morph", font=("SF Pro", 12),
             fg=CLR_TEXT, bg=CLR_BG, relief="solid", bd=1,
             padx=16, pady=6, cursor="hand2",
             highlightbackground=CLR_BORDER,
@@ -186,7 +186,7 @@ class GeneratorUI(tk.Frame):
         ).pack(side="left", padx=8)
 
         tk.Button(
-            btn_frame, text="← Main Menu", font=("SF Pro", 12),
+            btn_frame, text="<- Main Menu", font=("SF Pro", 12),
             fg=CLR_TEXT, bg=CLR_BG, relief="solid", bd=1,
             padx=16, pady=6, cursor="hand2",
             highlightbackground=CLR_BORDER,
@@ -286,7 +286,7 @@ class GeneratorUI(tk.Frame):
 
             # Refresh button
             tk.Button(
-                row, text="🔄", font=("SF Pro", 12),
+                row, text="Refresh", font=("SF Pro", 12),
                 fg=CLR_TEXT_SECONDARY, bg=CLR_BG_HOVER,
                 relief="flat", padx=8, pady=4,
                 command=lambda s=stage: self._randomize_stage(s),
@@ -400,7 +400,7 @@ class GeneratorUI(tk.Frame):
                 self._current_stage_imgs = stage_imgs
 
                 if current_img is not None:
-                    img_np = current_img.view(GRID_SIZE, GRID_SIZE).numpy()
+                    img_np = current_img.view(GRID_SIZE, GRID_SIZE).detach().numpy()
                     self.after(0, lambda: self._render_face(img_np))
 
             except Exception:
@@ -446,7 +446,7 @@ class GeneratorUI(tk.Frame):
                 self._current_stage_imgs = stage_imgs
 
                 if current_img is not None:
-                    img_np = current_img.view(GRID_SIZE, GRID_SIZE).numpy()
+                    img_np = current_img.view(GRID_SIZE, GRID_SIZE).detach().numpy()
                     self.after(0, lambda: self._render_face(img_np))
 
             except Exception:
@@ -458,7 +458,7 @@ class GeneratorUI(tk.Frame):
         thread.start()
 
     def _render_face(self, img_array):
-        """Render a 16×16 numpy array to the canvas."""
+        """Render a 16x16 numpy array to the canvas."""
         for y in range(GRID_SIZE):
             for x in range(GRID_SIZE):
                 color = CLR_DRAW_PIXEL if img_array[y][x] > RENDER_THRESHOLD else CLR_BG
@@ -499,18 +499,12 @@ class GeneratorUI(tk.Frame):
 
     @staticmethod
     def _fill_gaps_from_center(binary_np):
-        """Fill 1-2 pixel gaps in a head outline.
-
-        Flood fills from center to find the leak path, then from the border
-        inward to find which leak-path pixels are closest to the outline.
-        Those pixels at the narrowest point of the gap get filled.
-        """
+        """Fill 1-2 pixel gaps in a head outline."""
         gs = GRID_SIZE
         filled = binary_np.copy()
         center = gs // 2
 
         def flood_from(sy, sx, grid):
-            """BFS from (sy,sx) through empty pixels. Returns (visited, dist)."""
             visited = np.zeros((gs, gs), dtype=bool)
             dist = np.full((gs, gs), -1, dtype=int)
             queue = [(sy, sx)]
@@ -526,10 +520,9 @@ class GeneratorUI(tk.Frame):
                         queue.append((ny, nx))
             return visited, dist
 
-        for _ in range(4):  # Max 4 fill attempts
+        for _ in range(4):
             center_vis, center_dist = flood_from(center, center, filled)
 
-            # Check for border leaks
             border_leaks = []
             for y in range(gs):
                 for x in range(gs):
@@ -538,7 +531,6 @@ class GeneratorUI(tk.Frame):
             if not border_leaks:
                 break
 
-            # BFS from all border leak pixels inward
             border_dist = np.full((gs, gs), -1, dtype=int)
             border_vis = np.zeros((gs, gs), dtype=bool)
             queue = []
@@ -555,24 +547,18 @@ class GeneratorUI(tk.Frame):
                         border_dist[ny,nx] = border_dist[y,x] + 1
                         queue.append((ny, nx))
 
-            # The gap narrows where center_dist + border_dist is minimized.
-            # Find empty pixels on the leak path (reachable from both center
-            # and border) that are adjacent to outline pixels.
             best = None
             best_score = float('inf')
             for y in range(1, gs-1):
                 for x in range(1, gs-1):
                     if filled[y, x] or center_dist[y, x] < 0 or border_dist[y, x] < 0:
                         continue
-                    # Must be adjacent to at least 1 outline pixel
                     adj = sum(
                         1 for dy, dx in [(-1,0),(1,0),(0,-1),(0,1)]
                         if filled[y+dy, x+dx]
                     )
                     if adj < 1:
                         continue
-                    # Score: total path length through this pixel (lower = narrower gap)
-                    # Break ties by preferring more outline neighbors
                     path_len = center_dist[y, x] + border_dist[y, x]
                     score = (path_len, -adj)
                     if best is None or score < best_score:
@@ -596,7 +582,7 @@ class GeneratorUI(tk.Frame):
 
         stage1_img = self._current_stage_imgs[1]
         binary = (stage1_img > RENDER_THRESHOLD).float()
-        binary_np = binary.view(GRID_SIZE, GRID_SIZE).numpy().astype(np.uint8)
+        binary_np = binary.view(GRID_SIZE, GRID_SIZE).detach().numpy().astype(np.uint8)
 
         # Check if there are gaps
         gap_score = flood_fill_gap_score(stage1_img)
@@ -627,12 +613,10 @@ class GeneratorUI(tk.Frame):
         self._current_stage_imgs[1] = torch.tensor(
             fixed_np.reshape(1, -1), dtype=torch.float32,
         )
-        # Re-render with the fixed image visible at stage 1
         final_stage = max(self._current_stage_imgs.keys())
         if final_stage == 1:
             self._render_face(fixed_np.astype(float))
         else:
-            # Regenerate stages 2+ with the fixed base
             self._generate_face()
 
         self.status_label.config(text="Gap fixed! Training...", fg="#10B981")

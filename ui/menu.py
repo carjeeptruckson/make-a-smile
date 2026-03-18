@@ -13,14 +13,14 @@ from config import (
     KL_WARMUP_START, KL_WARMUP_END, KL_FINAL_BETA,
     TRAINING_EPOCHS, TRAINING_LR, NOISE_FACTOR, SHARPNESS_WEIGHT,
     CONNECTIVITY_WEIGHT, CONNECTIVITY_WARMUP_START, CONNECTIVITY_WARMUP_END,
-    BOUNDARY_WEIGHT,
+    BOUNDARY_WEIGHT, AUGMENT_SYMMETRY_STAGES,
     STAGE_REFINE_FILES, REFINE_MIN_SAMPLES, REFINE_TRAINING_EPOCHS,
     CRITIC_WEIGHT, CRITIC_WARMUP_END, FOCAL_ALPHA,
 )
 from model import (
     HeadVAE, ConditionalVAE, RefineModel,
     staged_loss, experimental_staged_loss, refine_loss,
-    kl_beta_schedule, add_noise,
+    kl_beta_schedule, add_noise, augment_batch,
 )
 
 # Design system colors
@@ -714,29 +714,14 @@ class MainMenu(tk.Frame):
                     except Exception:
                         pass
 
-                # Augmentation: horizontal flip (doubles data)
-                aug_targets = []
-                aug_bases = []
-                for i, t in enumerate(targets):
-                    aug_targets.append(t)
-                    grid = np.array(t).reshape(GRID_SIZE, GRID_SIZE)
-                    aug_targets.append(np.fliplr(grid).flatten().tolist())
-
-                    if bases:
-                        b = bases[i] if i < len(bases) else [0.0] * 256
-                        aug_bases.append(b)
-                        bgrid = np.array(b).reshape(GRID_SIZE, GRID_SIZE)
-                        aug_bases.append(np.fliplr(bgrid).flatten().tolist())
+                # Augmentation: flip + translations + symmetry
+                aug_targets, aug_bases = augment_batch(
+                    targets, bases, stage,
+                    symmetry_stages=AUGMENT_SYMMETRY_STAGES,
+                )
 
                 target_tensor = torch.tensor(aug_targets, dtype=torch.float32)
-
-                if stage == 1:
-                    base_tensor = torch.zeros_like(target_tensor)
-                else:
-                    if aug_bases:
-                        base_tensor = torch.tensor(aug_bases, dtype=torch.float32)
-                    else:
-                        base_tensor = torch.zeros_like(target_tensor)
+                base_tensor = torch.tensor(aug_bases, dtype=torch.float32)
 
                 # Create model
                 if stage == 1:
@@ -1259,24 +1244,14 @@ class MainMenu(tk.Frame):
                     except Exception:
                         pass
 
-                # Augmentation
-                aug_targets, aug_bases = [], []
-                for i, t in enumerate(targets):
-                    aug_targets.append(t)
-                    grid = np.array(t).reshape(GRID_SIZE, GRID_SIZE)
-                    aug_targets.append(np.fliplr(grid).flatten().tolist())
-                    if bases:
-                        b = bases[i] if i < len(bases) else [0.0] * 256
-                        aug_bases.append(b)
-                        bgrid = np.array(b).reshape(GRID_SIZE, GRID_SIZE)
-                        aug_bases.append(np.fliplr(bgrid).flatten().tolist())
+                # Augmentation: flip + translations + symmetry
+                aug_targets, aug_bases = augment_batch(
+                    targets, bases, stage,
+                    symmetry_stages=AUGMENT_SYMMETRY_STAGES,
+                )
 
                 target_tensor = torch.tensor(aug_targets, dtype=torch.float32)
-                if stage == 1:
-                    base_tensor = torch.zeros_like(target_tensor)
-                else:
-                    base_tensor = (torch.tensor(aug_bases, dtype=torch.float32)
-                                   if aug_bases else torch.zeros_like(target_tensor))
+                base_tensor = torch.tensor(aug_bases, dtype=torch.float32)
 
                 # Create fresh VAE model
                 if stage == 1:

@@ -100,6 +100,15 @@ class RefineUI(tk.Frame):
         )
         self.saved_counter_label.pack(side="right", padx=20)
 
+        self.auto_correct_var = tk.BooleanVar(value=False)
+        self.auto_correct_check = tk.Checkbutton(
+            self.status_frame, text="Auto-correct",
+            variable=self.auto_correct_var,
+            font=("SF Pro", 10), fg=CLR_TEXT_SECONDARY, bg=CLR_BG,
+            selectcolor=CLR_BG, activebackground=CLR_BG,
+        )
+        self.auto_correct_check.pack(side="right", padx=8)
+
         # ── Instruction ─────────────────────────────────────────
         self.instruction_label = tk.Label(
             self, text="How do you feel about this face?",
@@ -323,8 +332,8 @@ class RefineUI(tk.Frame):
             # Store the raw VAE output BEFORE any refine correction
             self.raw_vae_outputs[stage] = current_img.clone()
 
-            # Auto-correct with RefineModel if available
-            if stage in self.refine_models:
+            # Auto-correct with RefineModel if available and enabled
+            if stage in self.refine_models and self.auto_correct_var.get():
                 with torch.no_grad():
                     rm = self.refine_models[stage]
                     rm.eval()
@@ -334,8 +343,6 @@ class RefineUI(tk.Frame):
                               torch.zeros(1, 256)) > RENDER_THRESHOLD).float()
                     )
                     refined = rm(current_img, base_for_refine)
-                    # Binarize and merge with base (refine can only add/fix,
-                    # not erase base pixels)
                     refined_bin = (refined > RENDER_THRESHOLD).float()
                     if stage > 1:
                         refined_bin = torch.max(refined_bin, base_for_refine)
@@ -800,8 +807,8 @@ class RefineUI(tk.Frame):
                     # Store the raw VAE output BEFORE any refine correction
                     self.raw_vae_outputs[s] = current_img.clone()
 
-                    # Auto-correct with RefineModel if available
-                    if s in self.refine_models:
+                    # Auto-correct with RefineModel if available and enabled
+                    if s in self.refine_models and self.auto_correct_var.get():
                         rm = self.refine_models[s]
                         rm.eval()
                         refined = rm(current_img, condition)
